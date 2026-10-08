@@ -65,17 +65,9 @@ impl LineWrapper {
                             continue;
                         }
 
-                        if Self::is_word_char(c) {
-                            if prev_c == ' ' && c != ' ' && first_non_whitespace_ix.is_some() {
-                                last_candidate_ix = ix;
-                                last_candidate_width = width;
-                            }
-                        } else {
-                            // CJK may not be space separated, e.g.: `Hello world你好世界`
-                            if c != ' ' && first_non_whitespace_ix.is_some() {
-                                last_candidate_ix = ix;
-                                last_candidate_width = width;
-                            }
+                        if Self::can_break_before(prev_c, c) && first_non_whitespace_ix.is_some() {
+                            last_candidate_ix = ix;
+                            last_candidate_width = width;
                         }
 
                         if c != ' ' && first_non_whitespace_ix.is_none() {
@@ -103,6 +95,8 @@ impl LineWrapper {
                     }
                 };
 
+                // Keep the consumed character even when yielding a wrap boundary.
+                prev_c = new_prev_c;
                 width += item_width;
                 if width > wrap_width && ix > last_wrap_ix {
                     if let (None, Some(first_non_whitespace_ix)) = (indent, first_non_whitespace_ix)
@@ -127,8 +121,6 @@ impl LineWrapper {
 
                     return Some(Boundary::new(last_wrap_ix, indent.unwrap_or(0)));
                 }
-
-                prev_c = new_prev_c;
             }
 
             None
@@ -377,12 +369,7 @@ impl LineWrapper {
 
             let char_width = self.width_for_char(c);
 
-            if Self::is_word_char(c) {
-                if prev_c == ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = ix;
-                    last_candidate_width = width;
-                }
-            } else if c != ' ' && first_non_whitespace_ix.is_some() {
+            if Self::can_break_before(prev_c, c) && first_non_whitespace_ix.is_some() {
                 last_candidate_ix = ix;
                 last_candidate_width = width;
             }
@@ -443,6 +430,48 @@ impl LineWrapper {
 
         // Text fits within max_lines without truncation.
         (text, Cow::Borrowed(runs))
+    }
+
+    /// Whether a line may wrap between `prev` and `c`, so `c` would start the
+    /// next line.
+    ///
+    /// Words wrap only at spaces, while CJK text, which is not space
+    /// separated, wraps between any two characters, e.g. `Hello world你好世界`.
+    /// CJK line breaking rules (UAX #14 LB13/LB14) then keep closing
+    /// punctuation such as `。` off the start of a line and opening
+    /// punctuation such as `「` off its end. Text may still wrap after
+    /// CJK closing punctuation, as in `完成。Next` or `a、b`. Paths wrap after
+    /// a slash (LB13 `× SY`), so `vendor/` ends a line rather than `/gpui`
+    /// starting one.
+    pub(crate) fn can_break_before(prev: char, c: char) -> bool {
+        if c == ' ' || Self::is_opening_punctuation(prev) || Self::is_cjk_closing_punctuation(c) {
+            return false;
+        }
+        if prev == ' ' {
+            return true;
+        }
+        if c == '/' {
+            return false;
+        }
+        if !Self::is_word_char(c) {
+            return true;
+        }
+        (prev == '/' || Self::is_cjk_closing_punctuation(prev)) && !Self::is_closing_punctuation(c)
+    }
+
+    /// Punctuation that never ends a line because it opens what follows.
+    fn is_opening_punctuation(c: char) -> bool {
+        "([{“‘（［｛〈《「『【〔〖〘〚｟｢".contains(c)
+    }
+
+    /// Full-width and CJK punctuation that never starts a line.
+    fn is_cjk_closing_punctuation(c: char) -> bool {
+        "、。，．：；！？）］｝〉》」』】〕〗〙〛｠｣‥".contains(c)
+    }
+
+    /// Punctuation that never starts a line, Latin or CJK.
+    fn is_closing_punctuation(c: char) -> bool {
+        Self::is_cjk_closing_punctuation(c) || "!)]}\"”’»…,.:;".contains(c)
     }
 
     /// Any character in this list should be treated as a word character,
@@ -1200,6 +1229,84 @@ mod tests {
         assert_word("\u{202F}"); // NNBSP " "
         assert_word("\u{00A0}"); // NBSP " "
         assert_word("\u{2011}"); // NBH "‑"
+    }
+
+    #[test]
+    fn test_can_break_before() {
+        #[track_caller]
+        fn assert_breaks(text: &str, expected: &[bool]) {
+            let chars = text.chars().collect::<Vec<_>>();
+            let actual = chars
+                .windows(2)
+                .map(|pair| LineWrapper::can_break_before(pair[0], pair[1]))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{text}");
+        }
+
+        // Latin words wrap only at spaces; paths wrap after `/`, and a path
+        // that starts with one moves down whole.
+        assert_breaks("ab cd", &[false, false, true, false]);
+        assert_breaks("a/b", &[false, true]);
+        assert_breaks("a /b", &[false, true, true]);
+        assert_breaks("暂停/恢复", &[true, false, true, true]);
+        // CJK wraps between ideographs but never before closing punctuation.
+        assert_breaks("好。下", &[false, true]);
+        assert_breaks("败，」接", &[false, false, true]);
+        // Opening punctuation stays with what it opens.
+        assert_breaks("中（见", &[true, false]);
+        assert_breaks("中“唯”和", &[true, false, false, true]);
+        // Latin words around CJK punctuation keep their own breaks.
+        assert_breaks(
+            "pin、viewport",
+            &[
+                false, false, false, true, false, false, false, false, false, false, false,
+            ],
+        );
+        assert_breaks("完成。Next", &[true, false, true, false, false, false]);
+        assert_breaks("败。”", &[false, false]);
+    }
+
+    #[test]
+    fn test_wrap_line_keeps_cjk_closing_punctuation_off_line_start() {
+        let mut wrapper = build_wrapper();
+        // Exactly five ideographs fit, so the sixth character wraps.
+        let wrap_width = wrapper.width_for_char('一') * 5. + px(1.);
+
+        let plain = "一二三四五六七八";
+        let punctuated = "一二三四五。七八";
+        let boundaries = |wrapper: &mut LineWrapper, text: &str| {
+            wrapper
+                .wrap_line(&[LineFragment::text(text)], wrap_width)
+                .map(|boundary| boundary.ix)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(boundaries(&mut wrapper, plain), [15]);
+        // `。` would start the second line, so `五` moves down with it.
+        assert_eq!(boundaries(&mut wrapper, punctuated), [12]);
+    }
+
+    #[test]
+    fn test_wrap_line_updates_previous_character_before_yielding() {
+        let mut wrapper = build_wrapper();
+        let cases = [
+            (
+                "一二三四五。Next tail",
+                wrapper.width_for_char('一') * 5. + px(1.),
+                vec![12, 18, 23],
+            ),
+            (
+                "abcde/Nexttt tail",
+                wrapper.width_for_char('a') * 6. + px(1.),
+                vec![6, 12],
+            ),
+        ];
+        for (text, wrap_width, expected) in cases {
+            let boundaries = wrapper
+                .wrap_line(&[LineFragment::text(text)], wrap_width)
+                .map(|boundary| boundary.ix)
+                .collect::<Vec<_>>();
+            assert_eq!(boundaries, expected, "{text}");
+        }
     }
 
     // For compatibility with the test macro

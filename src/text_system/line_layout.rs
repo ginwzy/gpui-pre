@@ -192,6 +192,7 @@ impl LineLayout {
         text: &str,
         wrap_width: Pixels,
         max_lines: Option<usize>,
+        indent: LineIndent,
     ) -> SmallVec<[WrapBoundary; 1]> {
         let mut boundaries = SmallVec::new();
         let mut first_non_whitespace_ix = None;
@@ -226,16 +227,9 @@ impl LineLayout {
 
             // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
             // but there are some differences, so we have to duplicate the code here.
-            if LineWrapper::is_word_char(ch) {
-                if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
-                }
-            } else {
-                if ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
-                }
+            if LineWrapper::can_break_before(prev_ch, ch) && first_non_whitespace_ix.is_some() {
+                last_candidate_ix = Some(boundary);
+                last_candidate_x = x;
             }
 
             if ch != ' ' && first_non_whitespace_ix.is_none() {
@@ -245,7 +239,8 @@ impl LineLayout {
             let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
             let width = next_x - last_boundary_x;
 
-            if width > wrap_width && boundary > last_boundary {
+            let row_width = wrap_width - indent.for_row(boundaries.len());
+            if width > row_width && boundary > last_boundary {
                 // When used line_clamp, we should limit the number of lines.
                 if let Some(max_lines) = max_lines
                     && boundaries.len() >= max_lines.saturating_sub(1)
@@ -280,6 +275,35 @@ pub struct WrappedLineLayout {
 
     /// The width of the line, if it was wrapped
     pub wrap_width: Option<Pixels>,
+
+    /// How far each row is inset from the line's origin
+    pub indent: LineIndent,
+}
+
+/// Horizontal insets for the rows of a wrapped line, like CSS `padding-left`
+/// with a first-line `text-indent`. A list item hangs its wrapped rows under
+/// the text after its marker with `first: 0` and `rest` at the marker width.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct LineIndent {
+    /// The inset of the first row.
+    pub first: Pixels,
+    /// The inset of every following row.
+    pub rest: Pixels,
+}
+
+impl LineIndent {
+    /// The same inset for every row.
+    pub fn uniform(inset: Pixels) -> Self {
+        Self {
+            first: inset,
+            rest: inset,
+        }
+    }
+
+    /// The inset of the given row.
+    pub fn for_row(&self, row: usize) -> Pixels {
+        if row == 0 { self.first } else { self.rest }
+    }
 }
 
 /// A boundary at which a line was wrapped
@@ -300,9 +324,14 @@ impl WrappedLineLayout {
 
     /// The width of this line, in pixels, whether or not it was wrapped.
     pub fn width(&self) -> Pixels {
+        let indent = if self.wrap_boundaries.is_empty() {
+            self.indent.first
+        } else {
+            self.indent.first.max(self.indent.rest)
+        };
         self.wrap_width
             .unwrap_or(Pixels::MAX)
-            .min(self.unwrapped_layout.width)
+            .min(self.unwrapped_layout.width + indent)
     }
 
     /// The size of the whole wrapped text, for the given line_height.
@@ -401,7 +430,7 @@ impl WrappedLineLayout {
         };
 
         let mut position_in_unwrapped_line = position;
-        position_in_unwrapped_line.x += wrapped_line_start_x;
+        position_in_unwrapped_line.x += wrapped_line_start_x - self.indent.for_row(wrapped_line_ix);
         if position_in_unwrapped_line.x < wrapped_line_start_x {
             Err(wrapped_line_start_index)
         } else if position_in_unwrapped_line.x >= wrapped_line_end_x {
@@ -443,7 +472,7 @@ impl WrappedLineLayout {
             } else {
                 let line_start_x = self.unwrapped_layout.x_for_index(line_start_ix);
                 let x = self.unwrapped_layout.x_for_index(index) - line_start_x;
-                return Some(point(x, line_y));
+                return Some(point(x + self.indent.for_row(ix), line_y));
             }
         }
 
@@ -578,6 +607,7 @@ impl LineLayoutCache {
         runs: &[FontRun],
         wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
+        indent: LineIndent,
     ) -> Arc<WrappedLineLayout>
     where
         Text: AsRef<str>,
@@ -589,6 +619,7 @@ impl LineLayoutCache {
             runs,
             wrap_width,
             force_width: None,
+            indent,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -609,7 +640,12 @@ impl LineLayoutCache {
             let text = SharedString::from(text);
             let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
             let wrap_boundaries = if let Some(wrap_width) = wrap_width {
-                unwrapped_layout.compute_wrap_boundaries(text.as_ref(), wrap_width, max_lines)
+                unwrapped_layout.compute_wrap_boundaries(
+                    text.as_ref(),
+                    wrap_width,
+                    max_lines,
+                    indent,
+                )
             } else {
                 SmallVec::new()
             };
@@ -617,6 +653,7 @@ impl LineLayoutCache {
                 unwrapped_layout,
                 wrap_boundaries,
                 wrap_width,
+                indent,
             });
             let key = Arc::new(CacheKey {
                 text,
@@ -624,6 +661,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width,
                 force_width: None,
+                indent,
             });
 
             let mut current_frame = self.current_frame.write();
@@ -653,6 +691,7 @@ impl LineLayoutCache {
             runs,
             wrap_width: None,
             force_width,
+            indent: LineIndent::default(),
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -681,6 +720,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width: None,
                 force_width,
+                indent: LineIndent::default(),
             });
             let layout = Arc::new(layout);
             current_frame.lines.insert(key.clone(), layout.clone());
@@ -890,6 +930,7 @@ struct CacheKey {
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    indent: LineIndent,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -899,6 +940,7 @@ struct CacheKeyRef<'a> {
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    indent: LineIndent,
 }
 
 #[derive(Clone, Debug)]
@@ -991,6 +1033,7 @@ impl AsCacheKeyRef for CacheKey {
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
             force_width: self.force_width,
+            indent: self.indent,
         }
     }
 }
@@ -1053,6 +1096,68 @@ mod tests {
             .iter()
             .map(|g| f32::from(g.position.x))
             .collect()
+    }
+
+    fn hanging_list_item(indent: LineIndent) -> WrappedLineLayout {
+        // "• 一二三四五六", ten pixels per glyph.
+        let text = "• 一二三四五六";
+        let glyphs = text
+            .char_indices()
+            .enumerate()
+            .map(|(ix, (index, _))| glyph_at(ix as f32 * 10., index))
+            .collect();
+        let unwrapped_layout = Arc::new(LineLayout {
+            width: px(80.),
+            len: text.len(),
+            ..make_layout(glyphs)
+        });
+        let wrap_boundaries = unwrapped_layout.compute_wrap_boundaries(text, px(45.), None, indent);
+        WrappedLineLayout {
+            unwrapped_layout,
+            wrap_boundaries,
+            wrap_width: Some(px(45.)),
+            indent,
+        }
+    }
+
+    #[test]
+    fn test_hanging_indent_wraps_and_maps_indented_rows() {
+        let row_starts = |layout: &WrappedLineLayout| {
+            layout
+                .wrap_boundaries
+                .iter()
+                .map(|boundary| layout.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index)
+                .collect::<Vec<_>>()
+        };
+        // Unindented rows fit four ideographs after the first row.
+        assert_eq!(row_starts(&hanging_list_item(LineIndent::default())), [10]);
+
+        let hanging = LineIndent {
+            first: px(0.),
+            rest: px(20.),
+        };
+        let layout = hanging_list_item(hanging);
+        // Hung rows lose the marker width, so `五` starts a third row.
+        assert_eq!(row_starts(&layout), [10, 16]);
+        assert_eq!(
+            layout.position_for_index(4, px(20.)),
+            Some(point(px(20.), px(0.)))
+        );
+        // `四` sits after `三` on the hung second row.
+        assert_eq!(
+            layout.position_for_index(13, px(20.)),
+            Some(point(px(30.), px(20.)))
+        );
+        assert_eq!(
+            layout.index_for_position(point(px(31.), px(25.)), px(20.)),
+            Ok(13)
+        );
+        // A point in the hanging indent resolves to the start of its row.
+        assert_eq!(
+            layout.index_for_position(point(px(5.), px(25.)), px(20.)),
+            Err(10)
+        );
+        assert_eq!(layout.width(), px(45.));
     }
 
     #[test]

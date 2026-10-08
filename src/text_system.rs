@@ -526,6 +526,29 @@ impl WindowTextSystem {
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
+        self.shape_indented_text(
+            text,
+            font_size,
+            runs,
+            wrap_width,
+            line_clamp,
+            LineIndent::default(),
+        )
+    }
+
+    /// Like [`Self::shape_text`], with each row inset by `indent`. Only the
+    /// first row of the text takes `indent.first`; every other row, including
+    /// those of later lines, takes `indent.rest`.
+    pub fn shape_indented_text(
+        &self,
+        text: SharedString,
+        font_size: Pixels,
+        runs: &[TextRun],
+        wrap_width: Option<Pixels>,
+        line_clamp: Option<usize>,
+        indent: LineIndent,
+    ) -> Result<SmallVec<[WrappedLine; 1]>> {
+        let mut line_indent = indent;
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
 
@@ -592,7 +615,9 @@ impl WindowTextSystem {
                 &font_runs,
                 wrap_width,
                 max_wrap_lines.map(|max| max.saturating_sub(wrapped_lines)),
+                line_indent,
             );
+            line_indent = LineIndent::uniform(indent.rest);
             wrapped_lines += layout.wrap_boundaries.len();
 
             lines.push(WrappedLine {
