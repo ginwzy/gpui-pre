@@ -360,9 +360,8 @@ mod tests {
     use super::*;
     use usvg::fontdb::{Database, Family, Query};
 
-    const IBM_PLEX_REGULAR: &[u8] =
-        include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
-    const LILEX_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
+    const IBM_PLEX_REGULAR: &[u8] = include_bytes!("../tests/fonts/IBMPlexSans-Regular.ttf");
+    const LILEX_REGULAR: &[u8] = include_bytes!("../tests/fonts/Lilex-Regular.ttf");
 
     #[test]
     fn renders_parsed_svg_at_requested_size() -> Result<()> {

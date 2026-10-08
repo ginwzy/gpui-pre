@@ -304,6 +304,9 @@ mod tests {
             move |_, cx| ConfigurationTestView {
                 focus_handle: cx.focus_handle(),
                 configuration: custom,
+                candidate_offset: None,
+                candidate_bounds: None,
+                composition: None,
             }
         });
         let view = window.root(cx).unwrap();
@@ -381,9 +384,102 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn ime_position_follows_completed_layout_without_component_invalidation(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_window(|_, cx| ConfigurationTestView {
+            focus_handle: cx.focus_handle(),
+            configuration: TextInputConfiguration::default(),
+            candidate_offset: Some(crate::point(crate::px(20.), crate::px(30.))),
+            candidate_bounds: None,
+            composition: None,
+        });
+        let view = window.root(cx).unwrap();
+        let mut test_window = cx.test_window(window.into());
+        let window = AnyWindowHandle::from(window);
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+        };
+        draw(cx);
+        assert!(test_window.ime_positions().is_empty());
+        test_window.simulate_active_status_change(true);
+        cx.update_window(window, |_, window, cx| {
+            window.focus(&view.read(cx).focus_handle.clone(), cx);
+        })
+        .unwrap();
+        draw(cx);
+        let initial = view.read_with(cx, |view, _| view.candidate_bounds.unwrap());
+        assert_eq!(test_window.ime_positions(), vec![initial]);
+
+        // Blinking/repaint alone must neither send coordinates nor schedule another frame.
+        draw(cx);
+        assert_eq!(test_window.ime_positions().len(), 1);
+        cx.update_window(window, |_, window, _| {
+            assert!(window.next_frame_callbacks.borrow().is_empty());
+        })
+        .unwrap();
+
+        // Geometry is produced in paint, after the handler was registered.
+        view.update(cx, |view, cx| {
+            view.candidate_offset = Some(crate::point(crate::px(160.), crate::px(90.)));
+            cx.notify();
+        });
+        draw(cx);
+        let moved = view.read_with(cx, |view, _| view.candidate_bounds.unwrap());
+        assert_ne!(initial, moved);
+        assert_eq!(test_window.ime_positions(), vec![initial, moved]);
+
+        // A composing input keeps supplying its anchor while layout moves.
+        view.update(cx, |view, cx| {
+            view.composition = Some(2..5);
+            view.candidate_offset = Some(crate::point(crate::px(80.), crate::px(120.)));
+            cx.notify();
+        });
+        draw(cx);
+        assert_eq!(test_window.ime_positions().len(), 3);
+        assert_eq!(
+            test_window.ime_positions().last().copied(),
+            view.read_with(cx, |view, _| view.candidate_bounds)
+        );
+
+        // Physical coordinates change when scale changes, even if logical bounds don't.
+        test_window.simulate_scale_factor_change(1.5);
+        draw(cx);
+        assert_eq!(test_window.ime_positions().len(), 4);
+
+        // A different input focus needs a fresh position, even at identical bounds.
+        view.update(cx, |view, cx| {
+            view.focus_handle = cx.focus_handle();
+            cx.notify();
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.focus(&view.read(cx).focus_handle.clone(), cx);
+        })
+        .unwrap();
+        draw(cx);
+        assert_eq!(test_window.ime_positions().len(), 5);
+
+        test_window.simulate_active_status_change(false);
+        draw(cx);
+        assert_eq!(test_window.ime_positions().len(), 5);
+        test_window.simulate_active_status_change(true);
+        draw(cx);
+        assert_eq!(test_window.ime_positions().len(), 6);
+
+        cx.update_window(window, |_, window, cx| window.blur(cx))
+            .unwrap();
+        draw(cx);
+        assert_eq!(test_window.ime_positions().len(), 6);
+    }
+
     struct ConfigurationTestView {
         focus_handle: FocusHandle,
         configuration: TextInputConfiguration,
+        candidate_offset: Option<crate::Point<Pixels>>,
+        candidate_bounds: Option<Bounds<Pixels>>,
+        composition: Option<std::ops::Range<usize>>,
     }
 
     impl Render for ConfigurationTestView {
@@ -396,9 +492,17 @@ mod tests {
                     move |bounds, _, window, cx| {
                         window.handle_input(
                             &focus_handle,
-                            ElementInputHandler::new(bounds, view),
+                            ElementInputHandler::new(bounds, view.clone()),
                             cx,
                         );
+                        view.update(cx, |view, _| {
+                            view.candidate_bounds = view.candidate_offset.map(|offset| {
+                                Bounds::new(
+                                    bounds.origin + offset,
+                                    crate::size(crate::px(1.), crate::px(18.)),
+                                )
+                            });
+                        });
                     },
                 )
                 .size_full(),
@@ -423,7 +527,11 @@ mod tests {
             _window: &mut Window,
             _cx: &mut Context<Self>,
         ) -> Option<UTF16Selection> {
-            None
+            self.candidate_offset.map(|_| UTF16Selection {
+                range: self.composition.as_ref().map_or(0, |range| range.end)
+                    ..self.composition.as_ref().map_or(0, |range| range.end),
+                reversed: false,
+            })
         }
 
         fn marked_text_range(
@@ -431,7 +539,7 @@ mod tests {
             _window: &mut Window,
             _cx: &mut Context<Self>,
         ) -> Option<std::ops::Range<usize>> {
-            None
+            self.composition.clone()
         }
 
         fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
@@ -462,7 +570,7 @@ mod tests {
             _window: &mut Window,
             _cx: &mut Context<Self>,
         ) -> Option<Bounds<Pixels>> {
-            None
+            self.candidate_bounds
         }
 
         fn character_index_for_point(

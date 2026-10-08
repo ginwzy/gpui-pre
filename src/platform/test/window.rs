@@ -53,6 +53,7 @@ pub(crate) struct TestWindowState {
     input_handler: Option<PlatformInputHandler>,
     text_input_configurations: Vec<TextInputConfiguration>,
     text_input_state_changes: Vec<TextInputStateChange>,
+    ime_positions: Vec<Bounds<Pixels>>,
     is_fullscreen: bool,
     scale_factor: f32,
     appearance: WindowAppearance,
@@ -126,6 +127,7 @@ impl TestWindow {
             input_handler: None,
             text_input_configurations: Vec::new(),
             text_input_state_changes: Vec::new(),
+            ime_positions: Vec::new(),
             is_fullscreen: false,
             // Preserve the test platform's historical 2x default.
             scale_factor: 2.0,
@@ -208,6 +210,10 @@ impl TestWindow {
 
     pub fn text_input_state_changes(&self) -> Vec<TextInputStateChange> {
         self.0.lock().text_input_state_changes.clone()
+    }
+
+    pub fn ime_positions(&self) -> Vec<Bounds<Pixels>> {
+        self.0.lock().ime_positions.clone()
     }
 
     pub fn simulate_resize(&mut self, size: Size<Pixels>) {
@@ -585,7 +591,9 @@ impl PlatformWindow for TestWindow {
         state.start_external_drag_result
     }
 
-    fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
+    fn update_ime_position(&self, bounds: Bounds<Pixels>) {
+        self.0.lock().ime_positions.push(bounds);
+    }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         None
