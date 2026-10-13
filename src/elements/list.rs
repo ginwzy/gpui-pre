@@ -89,6 +89,8 @@ struct StateInner {
     scroll_handler: Option<Box<dyn FnMut(&ListScrollEvent, &mut Window, &mut App)>>,
     scrollbar_drag_start_height: Option<Pixels>,
     measuring_behavior: ListMeasuringBehavior,
+    /// The height of every item, when the client guarantees it.
+    uniform_item_height: Option<Pixels>,
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
 }
@@ -341,6 +343,7 @@ impl ListState {
             reset: false,
             scrollbar_drag_start_height: None,
             measuring_behavior: ListMeasuringBehavior::default(),
+            uniform_item_height: None,
             pending_scroll: None,
             follow_state: FollowState::default(),
         })));
@@ -354,6 +357,29 @@ impl ListState {
     pub fn measure_all(self) -> Self {
         self.0.borrow_mut().measuring_behavior = ListMeasuringBehavior::Measure(false);
         self
+    }
+
+    /// Declare that every item is `height` tall at any width, or `None` to stop.
+    ///
+    /// Unmeasured items, including those [`Self::splice`] inserts later, count at
+    /// this height, so the scroll extent is exact without measuring them and
+    /// [`Self::measure_all`] has nothing left to do. A width change keeps the
+    /// sizes. Visible items still lay out normally. Changing the height
+    /// re-estimates every item once.
+    pub fn set_uniform_item_height(&self, height: Option<Pixels>) {
+        let state = &mut *self.0.borrow_mut();
+        if state.uniform_item_height == height {
+            return;
+        }
+        state.uniform_item_height = height;
+        let size_hint = height.map(|height| size(px(0.), height));
+        state.items = SumTree::from_iter(
+            state.items.iter().map(|item| ListItem::Unmeasured {
+                size_hint,
+                focus_handle: item.focus_handle(),
+            }),
+            (),
+        );
     }
 
     /// Pre-populate every unmeasured item with a uniform height hint so the scrollbar thumb
@@ -542,7 +568,7 @@ impl ListState {
             focus_handles.into_iter().map(|focus_handle| {
                 spliced_count += 1;
                 ListItem::Unmeasured {
-                    size_hint: None,
+                    size_hint: state.uniform_item_height.map(|height| size(px(0.), height)),
                     focus_handle,
                 }
             }),
@@ -1285,7 +1311,9 @@ impl StateInner {
     ) -> Result<LayoutItemsResponse, ListOffset> {
         window.transact(|window| {
             match self.measuring_behavior {
-                ListMeasuringBehavior::Measure(has_measured) if !has_measured => {
+                ListMeasuringBehavior::Measure(has_measured)
+                    if !has_measured && self.uniform_item_height.is_none() =>
+                {
                     self.layout_all_items(bounds.size.width, render_item, measure_item, window, cx);
                 }
                 _ => {}
@@ -1566,10 +1594,12 @@ impl Element for List {
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
-        // If the width of the list has changed, invalidate all cached item heights
-        if state
-            .last_layout_bounds
-            .is_none_or(|last_bounds| last_bounds.size.width != bounds.size.width)
+        // If the width of the list has changed, invalidate all cached item heights,
+        // unless the client guarantees them at any width.
+        if state.uniform_item_height.is_none()
+            && state
+                .last_layout_bounds
+                .is_none_or(|last_bounds| last_bounds.size.width != bounds.size.width)
         {
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
@@ -1766,8 +1796,8 @@ mod test {
 
     use crate::{
         self as gpui, AppContext, Bounds, Context, Element, FollowMode, InteractiveElement,
-        IntoElement, ListState, Render, Styled, TestAppContext, Window, canvas, div, list, point,
-        px, size,
+        IntoElement, ListOffset, ListState, Render, Styled, TestAppContext, Window, canvas, div,
+        list, point, px, size,
     };
 
     #[gpui::test]
@@ -2137,6 +2167,59 @@ mod test {
             view.into_any_element()
         });
         assert_eq!(state.max_offset_for_scrollbar().y, px(300.));
+    }
+
+    #[gpui::test]
+    fn test_uniform_item_height_is_exact_without_measuring(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let state = ListState::new(1000, crate::ListAlignment::Top, px(0.)).measure_all();
+        state.set_uniform_item_height(Some(px(10.)));
+        let rendered = Rc::new(Cell::new(0));
+
+        struct TestView(ListState, Rc<Cell<usize>>);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let rendered = self.1.clone();
+                list(self.0.clone(), move |_, _, _| {
+                    rendered.set(rendered.get() + 1);
+                    div().h(px(10.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone(), rendered.clone())));
+        let draw = |width: f32, cx: &mut crate::VisualTestContext| {
+            cx.draw(point(px(0.), px(0.)), size(px(width), px(50.)), |_, _| {
+                view.clone().into_any_element()
+            });
+        };
+
+        // Only the five visible items lay out, despite measure_all.
+        draw(100., cx);
+        assert_eq!(rendered.get(), 5);
+        assert_eq!(state.max_offset_for_scrollbar().y, px(10_000. - 50.));
+
+        // Inserted items count at the same height before they are seen.
+        state.splice(500..500, 10);
+        draw(100., cx);
+        assert_eq!(state.max_offset_for_scrollbar().y, px(10_100. - 50.));
+
+        // A new width keeps every size; still only visible items lay out.
+        rendered.set(0);
+        draw(140., cx);
+        assert_eq!(rendered.get(), 5);
+        assert_eq!(state.max_offset_for_scrollbar().y, px(10_100. - 50.));
+
+        // Scrolling far shows the right items at their exact offsets.
+        state.scroll_to(ListOffset {
+            item_ix: 900,
+            offset_in_item: px(0.),
+        });
+        draw(140., cx);
+        assert_eq!(state.scroll_px_offset_for_scrollbar().y, px(-9_000.));
     }
 
     #[gpui::test]

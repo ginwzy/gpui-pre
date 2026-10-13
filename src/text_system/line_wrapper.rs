@@ -42,6 +42,26 @@ impl LineWrapper {
         fragments: &'a [LineFragment],
         wrap_width: Pixels,
     ) -> impl Iterator<Item = Boundary> + 'a {
+        self.wrap_line_with(fragments, wrap_width, true)
+    }
+
+    /// Wrap a line as [`Self::wrap_line`] does, but give every row the full
+    /// width: continuation rows do not repeat the line's leading indent. For
+    /// hosts that draw each row as its own unwrapped line.
+    pub fn wrap_line_unindented<'a>(
+        &'a mut self,
+        fragments: &'a [LineFragment],
+        wrap_width: Pixels,
+    ) -> impl Iterator<Item = Boundary> + 'a {
+        self.wrap_line_with(fragments, wrap_width, false)
+    }
+
+    fn wrap_line_with<'a>(
+        &'a mut self,
+        fragments: &'a [LineFragment],
+        wrap_width: Pixels,
+        hang_indent: bool,
+    ) -> impl Iterator<Item = Boundary> + 'a {
         let mut width = px(0.);
         let mut first_non_whitespace_ix = None;
         let mut indent = None;
@@ -99,7 +119,8 @@ impl LineWrapper {
                 prev_c = new_prev_c;
                 width += item_width;
                 if width > wrap_width && ix > last_wrap_ix {
-                    if let (None, Some(first_non_whitespace_ix)) = (indent, first_non_whitespace_ix)
+                    if let (true, None, Some(first_non_whitespace_ix)) =
+                        (hang_indent, indent, first_non_whitespace_ix)
                     {
                         indent = Some(
                             Self::MAX_INDENT.min((first_non_whitespace_ix - last_wrap_ix) as u32),
@@ -742,6 +763,28 @@ mod tests {
                 ..Default::default()
             })
             .collect()
+    }
+
+    #[test]
+    fn test_wrap_line_unindented_gives_every_row_the_full_width() {
+        let mut wrapper = build_wrapper();
+        let line = [LineFragment::text("     aaaaaaa")];
+        // The indented wrap repeats the five leading spaces on each row.
+        assert_eq!(wrapper.wrap_line(&line, px(72.)).count(), 3);
+        assert_eq!(
+            wrapper
+                .wrap_line_unindented(&line, px(72.))
+                .collect::<Vec<_>>(),
+            &[Boundary::new(7, 0)]
+        );
+        // Without leading indent both agree.
+        let line = [LineFragment::text("aa bbb cccc ddddd eeee")];
+        assert_eq!(
+            wrapper
+                .wrap_line_unindented(&line, px(72.))
+                .collect::<Vec<_>>(),
+            wrapper.wrap_line(&line, px(72.)).collect::<Vec<_>>()
+        );
     }
 
     #[test]
