@@ -215,6 +215,25 @@ impl TextSystem {
         Ok(result * font_size)
     }
 
+    /// The shaped width of `text` laid out as one line in a single font.
+    pub(crate) fn layout_str_width(
+        &self,
+        font_id: FontId,
+        font_size: Pixels,
+        text: &str,
+    ) -> Pixels {
+        self.platform_text_system
+            .layout_line(
+                text,
+                font_size,
+                &[FontRun {
+                    len: text.len(),
+                    font_id,
+                }],
+            )
+            .width
+    }
+
     // Consider removing this?
     /// Returns the shaped layout width of for the given character, in the given font and size.
     pub fn layout_width(&self, font_id: FontId, font_size: Pixels, ch: char) -> Pixels {

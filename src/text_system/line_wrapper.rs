@@ -20,6 +20,7 @@ pub struct LineWrapper {
     pub(crate) font_size: Pixels,
     cached_ascii_char_widths: [Option<Pixels>; 128],
     cached_other_char_widths: HashMap<char, Pixels>,
+    cached_cluster_widths: HashMap<String, Pixels>,
 }
 
 impl LineWrapper {
@@ -33,6 +34,7 @@ impl LineWrapper {
             font_size,
             cached_ascii_char_widths: [None; 128],
             cached_other_char_widths: HashMap::default(),
+            cached_cluster_widths: HashMap::default(),
         }
     }
 
@@ -41,26 +43,6 @@ impl LineWrapper {
         &'a mut self,
         fragments: &'a [LineFragment],
         wrap_width: Pixels,
-    ) -> impl Iterator<Item = Boundary> + 'a {
-        self.wrap_line_with(fragments, wrap_width, true)
-    }
-
-    /// Wrap a line as [`Self::wrap_line`] does, but give every row the full
-    /// width: continuation rows do not repeat the line's leading indent. For
-    /// hosts that draw each row as its own unwrapped line.
-    pub fn wrap_line_unindented<'a>(
-        &'a mut self,
-        fragments: &'a [LineFragment],
-        wrap_width: Pixels,
-    ) -> impl Iterator<Item = Boundary> + 'a {
-        self.wrap_line_with(fragments, wrap_width, false)
-    }
-
-    fn wrap_line_with<'a>(
-        &'a mut self,
-        fragments: &'a [LineFragment],
-        wrap_width: Pixels,
-        hang_indent: bool,
     ) -> impl Iterator<Item = Boundary> + 'a {
         let mut width = px(0.);
         let mut first_non_whitespace_ix = None;
@@ -119,8 +101,7 @@ impl LineWrapper {
                 prev_c = new_prev_c;
                 width += item_width;
                 if width > wrap_width && ix > last_wrap_ix {
-                    if let (true, None, Some(first_non_whitespace_ix)) =
-                        (hang_indent, indent, first_non_whitespace_ix)
+                    if let (None, Some(first_non_whitespace_ix)) = (indent, first_non_whitespace_ix)
                     {
                         indent = Some(
                             Self::MAX_INDENT.min((first_non_whitespace_ix - last_wrap_ix) as u32),
@@ -464,7 +445,7 @@ impl LineWrapper {
     /// CJK closing punctuation, as in `完成。Next` or `a、b`. Paths wrap after
     /// a slash (LB13 `× SY`), so `vendor/` ends a line rather than `/gpui`
     /// starting one.
-    pub(crate) fn can_break_before(prev: char, c: char) -> bool {
+    pub fn can_break_before(prev: char, c: char) -> bool {
         if c == ' ' || Self::is_opening_punctuation(prev) || Self::is_cjk_closing_punctuation(c) {
             return false;
         }
@@ -537,6 +518,29 @@ impl LineWrapper {
 
         // Non-breaking glue characters
         matches!(c, '\u{202F}' | '\u{00A0}' | '\u{2011}')
+    }
+
+    /// The advance of one character in this wrapper's font and size, cached.
+    pub fn char_width(&mut self, c: char) -> Pixels {
+        self.width_for_char(c)
+    }
+
+    /// The advance of one grapheme cluster, shaped whole and cached. A ZWJ emoji
+    /// sequence or a character with a modifier is usually one glyph, narrower
+    /// than the sum of its characters.
+    pub fn cluster_width(&mut self, cluster: &str) -> Pixels {
+        let mut chars = cluster.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            return self.width_for_char(c);
+        }
+        if let Some(width) = self.cached_cluster_widths.get(cluster) {
+            return *width;
+        }
+        let width = self
+            .text_system
+            .layout_str_width(self.font_id, self.font_size, cluster);
+        self.cached_cluster_widths.insert(cluster.to_owned(), width);
+        width
     }
 
     #[inline(always)]
@@ -763,28 +767,6 @@ mod tests {
                 ..Default::default()
             })
             .collect()
-    }
-
-    #[test]
-    fn test_wrap_line_unindented_gives_every_row_the_full_width() {
-        let mut wrapper = build_wrapper();
-        let line = [LineFragment::text("     aaaaaaa")];
-        // The indented wrap repeats the five leading spaces on each row.
-        assert_eq!(wrapper.wrap_line(&line, px(72.)).count(), 3);
-        assert_eq!(
-            wrapper
-                .wrap_line_unindented(&line, px(72.))
-                .collect::<Vec<_>>(),
-            &[Boundary::new(7, 0)]
-        );
-        // Without leading indent both agree.
-        let line = [LineFragment::text("aa bbb cccc ddddd eeee")];
-        assert_eq!(
-            wrapper
-                .wrap_line_unindented(&line, px(72.))
-                .collect::<Vec<_>>(),
-            wrapper.wrap_line(&line, px(72.)).collect::<Vec<_>>()
-        );
     }
 
     #[test]
