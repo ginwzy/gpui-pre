@@ -19,8 +19,6 @@ use std::{cell::RefCell, ops::Range, rc::Rc};
 use sum_tree::{Bias, Dimensions, SumTree};
 
 type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
-type MeasureItemFn =
-    dyn FnMut(usize, Pixels, &mut Window, &mut App) -> Option<Size<Pixels>> + 'static;
 
 /// Construct a new list element
 pub fn list(
@@ -30,7 +28,6 @@ pub fn list(
     List {
         state,
         render_item: Box::new(render_item),
-        measure_item: None,
         style: StyleRefinement::default(),
         sizing_behavior: ListSizingBehavior::default(),
     }
@@ -40,26 +37,11 @@ pub fn list(
 pub struct List {
     state: ListState,
     render_item: Box<RenderItemFn>,
-    measure_item: Option<Box<MeasureItemFn>>,
     style: StyleRefinement,
     sizing_behavior: ListSizingBehavior,
 }
 
 impl List {
-    /// Measure an offscreen item without constructing its full element tree.
-    ///
-    /// Return the exact size that `render_item` would lay out at the supplied
-    /// width, or `None` to use the normal element layout. This only replaces
-    /// the eager `measure_all` pass; visible elements still lay out normally.
-    /// Sizes remain owned and invalidated by `ListState`.
-    pub fn with_measure_item(
-        mut self,
-        measure: impl FnMut(usize, Pixels, &mut Window, &mut App) -> Option<Size<Pixels>> + 'static,
-    ) -> Self {
-        self.measure_item = Some(Box::new(measure));
-        self
-    }
-
     /// Set the sizing behavior for the list.
     pub fn with_sizing_behavior(mut self, behavior: ListSizingBehavior) -> Self {
         self.sizing_behavior = behavior;
@@ -1030,7 +1012,6 @@ impl StateInner {
         &mut self,
         available_width: Pixels,
         render_item: &mut RenderItemFn,
-        measure_item: &mut Option<Box<MeasureItemFn>>,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -1056,12 +1037,6 @@ impl StateInner {
 
         for (ix, item) in cursor.enumerate() {
             let size = item.size().unwrap_or_else(|| {
-                if let Some(size) = measure_item
-                    .as_mut()
-                    .and_then(|measure| measure(ix, available_width, window, cx))
-                {
-                    return size;
-                }
                 let mut element = render_item(ix, window, cx);
                 element.layout_as_root(available_item_space, window, cx)
             });
@@ -1305,7 +1280,6 @@ impl StateInner {
         padding: Edges<Pixels>,
         autoscroll: bool,
         render_item: &mut RenderItemFn,
-        measure_item: &mut Option<Box<MeasureItemFn>>,
         window: &mut Window,
         cx: &mut App,
     ) -> Result<LayoutItemsResponse, ListOffset> {
@@ -1314,7 +1288,7 @@ impl StateInner {
                 ListMeasuringBehavior::Measure(has_measured)
                     if !has_measured && self.uniform_item_height.is_none() =>
                 {
-                    self.layout_all_items(bounds.size.width, render_item, measure_item, window, cx);
+                    self.layout_all_items(bounds.size.width, render_item, window, cx);
                 }
                 _ => {}
             }
@@ -1616,31 +1590,16 @@ impl Element for List {
         let padding = style
             .padding
             .to_pixels(bounds.size.into(), window.rem_size());
-        let layout = match state.prepaint_items(
-            bounds,
-            padding,
-            true,
-            &mut self.render_item,
-            &mut self.measure_item,
-            window,
-            cx,
-        ) {
-            Ok(layout) => layout,
-            Err(autoscroll_request) => {
-                state.logical_scroll_top = Some(autoscroll_request);
-                state
-                    .prepaint_items(
-                        bounds,
-                        padding,
-                        false,
-                        &mut self.render_item,
-                        &mut self.measure_item,
-                        window,
-                        cx,
-                    )
-                    .unwrap()
-            }
-        };
+        let layout =
+            match state.prepaint_items(bounds, padding, true, &mut self.render_item, window, cx) {
+                Ok(layout) => layout,
+                Err(autoscroll_request) => {
+                    state.logical_scroll_top = Some(autoscroll_request);
+                    state
+                        .prepaint_items(bounds, padding, false, &mut self.render_item, window, cx)
+                        .unwrap()
+                }
+            };
 
         state.last_layout_bounds = Some(bounds);
         state.last_padding = Some(padding);
