@@ -336,6 +336,9 @@ struct ListItemSummary {
     height: Pixels,
     has_focus_handles: bool,
     has_unknown_height: bool,
+    /// Whether any item has a height that a width change drops: a measurement
+    /// or an estimate.
+    has_width_bound_height: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -405,19 +408,22 @@ impl ListState {
         heights: impl IntoIterator<Item = Option<Pixels>>,
     ) {
         let state = &mut *self.0.borrow_mut();
-        let mut measure = false;
+        let heights: Vec<_> = heights.into_iter().collect();
         let mut cursor = state.items.cursor::<Count>(());
         let mut new_items = cursor.slice(&Count(start), Bias::Right);
-        let mut declared = Vec::new();
-        for height in heights {
-            let Some(item) = cursor.item() else {
-                break;
-            };
-            measure |= height.is_none();
-            declared.push(ListItem::new(height, item.focus_handle()));
-            cursor.next();
-        }
-        new_items.extend(declared, ());
+        // Slicing the declared range out and iterating it avoids counting
+        // every item on the way.
+        let replaced = cursor.slice(&Count(start + heights.len()), Bias::Right);
+        let measure = heights[..replaced.summary().count]
+            .iter()
+            .any(Option::is_none);
+        new_items.extend(
+            replaced
+                .iter()
+                .zip(heights)
+                .map(|(item, height)| ListItem::new(height, item.focus_handle())),
+            (),
+        );
         new_items.append(cursor.suffix(), ());
         drop(cursor);
         state.items = new_items;
@@ -1645,9 +1651,11 @@ impl Element for List {
             .last_layout_bounds
             .is_none_or(|last_bounds| last_bounds.size.width != bounds.size.width)
         {
-            let new_items = SumTree::from_iter(state.items.iter().map(ListItem::invalidated), ());
-
-            state.items = new_items;
+            if state.items.summary().has_width_bound_height {
+                let new_items =
+                    SumTree::from_iter(state.items.iter().map(ListItem::invalidated), ());
+                state.items = new_items;
+            }
             state.measuring_behavior.reset();
         }
 
@@ -1748,6 +1756,7 @@ impl sum_tree::Item for ListItem {
                 },
                 has_focus_handles: focus_handle.is_some(),
                 has_unknown_height: size_hint.is_none(),
+                has_width_bound_height: size_hint.is_some(),
             },
             ListItem::Measured {
                 size, focus_handle, ..
@@ -1758,6 +1767,7 @@ impl sum_tree::Item for ListItem {
                 height: size.height,
                 has_focus_handles: focus_handle.is_some(),
                 has_unknown_height: false,
+                has_width_bound_height: true,
             },
             ListItem::Declared {
                 height,
@@ -1769,6 +1779,7 @@ impl sum_tree::Item for ListItem {
                 height: *height,
                 has_focus_handles: focus_handle.is_some(),
                 has_unknown_height: false,
+                has_width_bound_height: false,
             },
         }
     }
@@ -1783,6 +1794,7 @@ impl sum_tree::ContextLessSummary for ListItemSummary {
         self.count += summary.count;
         self.rendered_count += summary.rendered_count;
         self.unrendered_count += summary.unrendered_count;
+        self.has_width_bound_height |= summary.has_width_bound_height;
         self.height += summary.height;
         self.has_focus_handles |= summary.has_focus_handles;
         self.has_unknown_height |= summary.has_unknown_height;
