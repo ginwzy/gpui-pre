@@ -401,6 +401,7 @@ pub struct StyledText {
     delayed_font_family_overrides: Option<Vec<(Range<usize>, SharedString)>>,
     line_indent: LineIndent,
     layout: TextLayout,
+    prepared: Option<std::sync::Arc<crate::PreparedLine>>,
 }
 
 impl StyledText {
@@ -413,12 +414,25 @@ impl StyledText {
             delayed_font_family_overrides: None,
             line_indent: LineIndent::default(),
             layout: TextLayout::default(),
+            prepared: None,
         }
     }
 
     /// Inset the rows of this text, e.g. to hang wrapped rows under a marker.
     pub fn with_line_indent(mut self, indent: LineIndent) -> Self {
         self.line_indent = indent;
+        self
+    }
+
+    /// Attach a row prepared for exactly this text and its effective fonts.
+    /// Only unwrapped, untruncated text uses it. The document retains ownership
+    /// of the immutable result; this element only shares it for this frame.
+    /// For excessive glyph counts, the host must resolve
+    /// [`TextLayout::prepared_paint_request`] and paint its image. Until then,
+    /// this element paints a bounded glyph preview with the complete geometry.
+    pub fn with_prepared_line(mut self, prepared: std::sync::Arc<crate::PreparedLine>) -> Self {
+        debug_assert_eq!(self.text.len(), prepared.text().len());
+        self.prepared = Some(prepared);
         self
     }
 
@@ -585,9 +599,14 @@ impl Element for StyledText {
             Self::apply_font_family_overrides(runs, overrides);
         }
 
-        let layout_id = self
-            .layout
-            .layout(self.text.clone(), runs, self.line_indent, window, cx);
+        let layout_id = self.layout.layout_with_prepared(
+            self.text.clone(),
+            runs,
+            self.line_indent,
+            self.prepared.clone(),
+            window,
+            cx,
+        );
         (layout_id, ())
     }
 
@@ -637,6 +656,7 @@ struct TextLayoutInner {
     truncate_width: Option<Pixels>,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
+    prepared: Option<Arc<crate::PreparedLine>>,
 }
 
 impl TextLayout {
@@ -645,6 +665,18 @@ impl TextLayout {
         text: SharedString,
         runs: Option<Vec<TextRun>>,
         indent: LineIndent,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> LayoutId {
+        self.layout_with_prepared(text, runs, indent, None, window, cx)
+    }
+
+    fn layout_with_prepared(
+        &self,
+        text: SharedString,
+        runs: Option<Vec<TextRun>>,
+        indent: LineIndent,
+        prepared: Option<std::sync::Arc<crate::PreparedLine>>,
         window: &mut Window,
         _: &mut App,
     ) -> LayoutId {
@@ -752,18 +784,26 @@ impl TextLayout {
                 };
                 let len = text.len();
 
-                let Some(lines) = window
-                    .text_system()
-                    .shape_indented_text(
-                        text,
-                        font_size,
-                        &runs,
-                        wrap_width,            // Wrap if we know the width.
-                        text_style.line_clamp, // Limit the number of lines if line_clamp is set.
-                        indent,
-                    )
-                    .log_err()
-                else {
+                let lines = if let Some(prepared) = prepared
+                    .as_ref()
+                    .filter(|_| wrap_width.is_none() && truncate_width.is_none())
+                {
+                    debug_assert_eq!(prepared.layout.font_size, font_size);
+                    Some(smallvec::smallvec![prepared.decorated(&runs, indent)])
+                } else {
+                    window
+                        .text_system()
+                        .shape_indented_text(
+                            text,
+                            font_size,
+                            &runs,
+                            wrap_width,            // Wrap if we know the width.
+                            text_style.line_clamp, // Limit the number of lines if line_clamp is set.
+                            indent,
+                        )
+                        .log_err()
+                };
+                let Some(lines) = lines else {
                     element_state.0.borrow_mut().replace(TextLayoutInner {
                         lines: Default::default(),
                         len: 0,
@@ -772,6 +812,7 @@ impl TextLayout {
                         truncate_width,
                         size: Some(Size::default()),
                         bounds: None,
+                        prepared: None,
                     });
                     return Size::default();
                 };
@@ -791,6 +832,9 @@ impl TextLayout {
                     truncate_width,
                     size: Some(size),
                     bounds: None,
+                    prepared: prepared
+                        .clone()
+                        .filter(|_| wrap_width.is_none() && truncate_width.is_none()),
                 });
 
                 size
@@ -822,6 +866,26 @@ impl TextLayout {
         let mut line_origin = bounds.origin;
         let text_style = window.text_style();
         for line in &element_state.lines {
+            let preview;
+            let line = if let Some(prepared) = element_state
+                .prepared
+                .as_ref()
+                .filter(|line| line.glyph_count > 4096)
+            {
+                preview = crate::WrappedLine {
+                    layout: Arc::new(WrappedLineLayout {
+                        unwrapped_layout: prepared.preview.clone(),
+                        wrap_boundaries: Default::default(),
+                        wrap_width: None,
+                        indent: line.indent,
+                    }),
+                    decoration_runs: line.decoration_runs.clone(),
+                    text: line.text.clone(),
+                };
+                &preview
+            } else {
+                line
+            };
             line.paint_background(
                 line_origin,
                 line_height,
@@ -858,6 +922,19 @@ impl TextLayout {
             return Err(0);
         }
 
+        if let Some(prepared) = &element_state.prepared {
+            let x = position.x - bounds.origin.x - element_state.lines[0].indent.first;
+            return if position.y > bounds.origin.y + element_state.line_height
+                || x >= prepared.layout.width
+            {
+                Err(prepared.layout.len)
+            } else if x < crate::px(0.) {
+                Err(0)
+            } else {
+                Ok(prepared.index_for_x(x))
+            };
+        }
+
         let line_height = element_state.line_height;
         let mut line_origin = bounds.origin;
         let mut line_start_ix = 0;
@@ -889,6 +966,17 @@ impl TextLayout {
             .expect("prepaint has not been performed");
         let line_height = element_state.line_height;
 
+        if let Some(prepared) = &element_state.prepared {
+            return (index <= prepared.layout.len).then(|| {
+                bounds.origin
+                    + crate::point(
+                        prepared.x_for_index(index) - prepared.x_for_index(0)
+                            + element_state.lines[0].indent.first,
+                        crate::px(0.),
+                    )
+            });
+        }
+
         let mut line_origin = bounds.origin;
         let mut line_start_ix = 0;
 
@@ -907,6 +995,35 @@ impl TextLayout {
         }
 
         None
+    }
+
+    /// Nearest caret in a prepared, unwrapped row. The point is relative to
+    /// this layout's origin; `None` leaves other layouts on their normal path.
+    pub fn closest_prepared_caret_index(&self, position: Point<Pixels>) -> Option<usize> {
+        let state = self.0.borrow();
+        let state = state.as_ref()?;
+        let prepared = state.prepared.as_ref()?;
+        Some(prepared.closest_caret(position.x - state.lines[0].indent.first))
+    }
+
+    /// Capture a bounded visible image request for a row with excessive glyphs.
+    /// The caller schedules preparation and retains the matching image.
+    pub fn prepared_paint_request(&self, window: &Window) -> Option<crate::PreparedLinePaint> {
+        let state = self.0.borrow();
+        let state = state.as_ref()?;
+        let prepared = state
+            .prepared
+            .as_ref()
+            .filter(|line| line.glyph_count > 4096)?;
+        Some(crate::PreparedLinePaint::new(
+            prepared.clone(),
+            &state.lines[0].decoration_runs,
+            state.bounds?,
+            state.lines[0].indent.first,
+            state.line_height,
+            window.text_style().text_align,
+            window,
+        ))
     }
 
     /// Retrieve the layout for the line containing the given byte index.

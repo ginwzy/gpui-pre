@@ -259,6 +259,48 @@ enum ListItem {
     },
 }
 
+/// Immutable list geometry prepared independently of scrolling state. Building
+/// or retiring a batch visits only that batch; appending and splicing reuse
+/// the existing SumTree nodes. This type owns no scroll or focus policy.
+#[derive(Clone, Default)]
+pub struct PreparedListItems(SumTree<ListItem>);
+
+impl PreparedListItems {
+    /// An empty batch with no scrolling state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The number of prepared items.
+    pub fn len(&self) -> usize {
+        self.0.summary().count
+    }
+
+    /// Whether the batch contains no items.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Append one bounded batch of declared heights.
+    pub fn extend(&mut self, heights: impl IntoIterator<Item = Option<Pixels>>) {
+        self.0.extend(
+            heights
+                .into_iter()
+                .map(|height| ListItem::new(height, None)),
+            (),
+        );
+    }
+
+    /// Release at most `count` retained items, for bounded foreground cleanup.
+    pub fn retire(&mut self, count: usize) {
+        let mut cursor = self.0.cursor::<Count>(());
+        cursor.seek(&Count(count.min(self.len())), Bias::Right);
+        let rest = cursor.suffix();
+        drop(cursor);
+        self.0 = rest;
+    }
+}
+
 impl ListItem {
     fn new(height: Option<Pixels>, focus_handle: Option<FocusHandle>) -> Self {
         match height {
@@ -625,14 +667,25 @@ impl ListState {
     }
 
     fn splice_items(&self, old_range: Range<usize>, items: impl IntoIterator<Item = ListItem>) {
+        self.splice_prepared(old_range, PreparedListItems(SumTree::from_iter(items, ())));
+    }
+
+    /// Replace a range with geometry prepared in bounded batches. Attaching
+    /// the persistent tree does not visit the inserted items. The returned
+    /// tree retains the removed items so its owner can retire them separately.
+    pub fn splice_prepared(
+        &self,
+        old_range: Range<usize>,
+        items: PreparedListItems,
+    ) -> PreparedListItems {
         let state = &mut *self.0.borrow_mut();
 
         let mut old_items = state.items.cursor::<Count>(());
         let mut new_items = old_items.slice(&Count(old_range.start), Bias::Right);
-        old_items.seek_forward(&Count(old_range.end), Bias::Right);
+        let removed = old_items.slice(&Count(old_range.end), Bias::Right);
 
-        let mut spliced_count = 0;
-        new_items.extend(items.into_iter().inspect(|_| spliced_count += 1), ());
+        let spliced_count = items.0.summary().count;
+        new_items.append(items.0, ());
         new_items.append(old_items.suffix(), ());
         drop(old_items);
         state.items = new_items;
@@ -649,6 +702,7 @@ impl ListState {
                 *item_ix = *item_ix - (old_range.end - old_range.start) + spliced_count;
             }
         }
+        PreparedListItems(removed)
     }
 
     /// Set a handler that will be called when the list is scrolled.
@@ -1842,8 +1896,8 @@ mod test {
 
     use crate::{
         self as gpui, AppContext, Bounds, Context, Element, FollowMode, InteractiveElement,
-        IntoElement, ListOffset, ListState, Render, Styled, TestAppContext, Window, canvas, div,
-        list, point, px, size,
+        IntoElement, ListOffset, ListState, PreparedListItems, Render, Styled, TestAppContext,
+        Window, canvas, div, list, point, px, size,
     };
 
     #[gpui::test]
@@ -2213,6 +2267,32 @@ mod test {
             view.into_any_element()
         });
         assert_eq!(state.max_offset_for_scrollbar().y, px(300.));
+    }
+
+    #[test]
+    fn prepared_geometry_preserves_exact_height_and_scroll_anchor() {
+        let state = ListState::new(0, crate::ListAlignment::Top, px(0.));
+        state.splice_with_heights(0..0, [Some(px(10.)); 4]);
+        state.scroll_to(ListOffset {
+            item_ix: 3,
+            offset_in_item: px(4.),
+        });
+        let mut prepared = PreparedListItems::new();
+        for _ in 0..200 {
+            prepared.extend([Some(px(2.)); 512]);
+        }
+        let retained = prepared.clone();
+        let removed = state.splice_prepared(1..2, prepared);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(retained.len(), 102400);
+        assert_eq!(state.item_count(), 102403);
+        assert_eq!(state.0.borrow().items.summary().height, px(204830.));
+        let top = state.logical_scroll_top();
+        assert_eq!((top.item_ix, top.offset_in_item), (102402, px(4.)));
+        let mut removed = state.splice_prepared(1..102401, removed);
+        removed.retire(512);
+        assert_eq!(removed.len(), 101888);
+        assert_eq!(state.0.borrow().items.summary().height, px(40.));
     }
 
     #[gpui::test]

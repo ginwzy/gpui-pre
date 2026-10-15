@@ -543,6 +543,19 @@ impl LineWrapper {
         width
     }
 
+    /// Measure a cluster on a background executor without occupying a shared
+    /// foreground shaping context. Uses the same font/size measurement cache.
+    pub fn cluster_width_in_background(&mut self, cluster: &str) -> Pixels {
+        if let Some(width) = self.cached_cluster_widths.get(cluster) {
+            return *width;
+        }
+        let width =
+            self.text_system
+                .layout_str_width_in_background(self.font_id, self.font_size, cluster);
+        self.cached_cluster_widths.insert(cluster.to_owned(), width);
+        width
+    }
+
     #[inline(always)]
     fn width_for_char(&mut self, c: char) -> Pixels {
         if (c as u32) < 128 {
