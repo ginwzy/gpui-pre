@@ -1,4 +1,4 @@
-use crate::{FontId, Pixels, SharedString, TextRun, TextSystem, px};
+use crate::{FontId, Pixels, SharedString, TextRun, TextSystem, displayed_cluster, px};
 use collections::HashMap;
 use std::{borrow::Cow, iter, sync::Arc};
 
@@ -527,32 +527,22 @@ impl LineWrapper {
 
     /// The advance of one grapheme cluster, shaped whole and cached. A ZWJ emoji
     /// sequence or a character with a modifier is usually one glyph, narrower
-    /// than the sum of its characters.
+    /// than the sum of its characters. Display shapes only the cluster's first
+    /// [`crate::MAX_DISPLAY_CLUSTER_CHARS`] characters, so the measurement and its
+    /// cache key are bounded by that prefix however long the cluster is.
     pub fn cluster_width(&mut self, cluster: &str) -> Pixels {
         let mut chars = cluster.chars();
         if let (Some(c), None) = (chars.next(), chars.next()) {
             return self.width_for_char(c);
         }
-        if let Some(width) = self.cached_cluster_widths.get(cluster) {
+        let shaped = displayed_cluster(cluster);
+        if let Some(width) = self.cached_cluster_widths.get(shaped) {
             return *width;
         }
         let width = self
             .text_system
-            .layout_str_width(self.font_id, self.font_size, cluster);
-        self.cached_cluster_widths.insert(cluster.to_owned(), width);
-        width
-    }
-
-    /// Measure a cluster on a background executor without occupying a shared
-    /// foreground shaping context. Uses the same font/size measurement cache.
-    pub fn cluster_width_in_background(&mut self, cluster: &str) -> Pixels {
-        if let Some(width) = self.cached_cluster_widths.get(cluster) {
-            return *width;
-        }
-        let width =
-            self.text_system
-                .layout_str_width_in_background(self.font_id, self.font_size, cluster);
-        self.cached_cluster_widths.insert(cluster.to_owned(), width);
+            .layout_str_width(self.font_id, self.font_size, shaped);
+        self.cached_cluster_widths.insert(shaped.to_owned(), width);
         width
     }
 

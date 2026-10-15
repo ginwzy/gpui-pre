@@ -1,18 +1,17 @@
+mod display_bound;
 mod font_fallbacks;
 mod font_features;
 mod line;
 mod line_layout;
 mod line_wrapper;
-mod prepared_line;
-mod prepared_paint;
 
+pub(crate) use display_bound::layout_line_bounded;
+pub use display_bound::{MAX_DISPLAY_CLUSTER_CHARS, displayed_cluster};
 pub use font_fallbacks::*;
 pub use font_features::*;
 pub use line::*;
 pub use line_layout::*;
 pub use line_wrapper::*;
-pub use prepared_line::*;
-pub use prepared_paint::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -226,48 +225,16 @@ impl TextSystem {
         font_size: Pixels,
         text: &str,
     ) -> Pixels {
-        let layout = self.platform_text_system.layout_line(
+        layout_line_bounded(
+            self.platform_text_system.as_ref(),
             text,
             font_size,
             &[FontRun {
                 len: text.len(),
                 font_id,
             }],
-        );
-        if text.len() > 1_000_000 {
-            eprintln!(
-                "BIG_CLUSTER len={} width={:?} first={:?} last={:?}",
-                text.len(),
-                layout.width,
-                layout
-                    .runs
-                    .first()
-                    .map(|r| r.glyphs.iter().take(5).collect::<Vec<_>>()),
-                layout
-                    .runs
-                    .last()
-                    .map(|r| r.glyphs.iter().rev().take(5).collect::<Vec<_>>())
-            );
-        }
-        layout.width
-    }
-
-    pub(crate) fn layout_str_width_in_background(
-        &self,
-        font_id: FontId,
-        font_size: Pixels,
-        text: &str,
-    ) -> Pixels {
-        self.platform_text_system
-            .layout_line_in_background(
-                text,
-                font_size,
-                &[FontRun {
-                    len: text.len(),
-                    font_id,
-                }],
-            )
-            .width
+        )
+        .width
     }
 
     // Consider removing this?

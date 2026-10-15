@@ -491,6 +491,9 @@ version = "0.1.40"
 [dependencies.ttf-parser]
 version = "0.25"
 
+[dependencies.unicode-segmentation]
+version = "1.10"
+
 [dependencies.url]
 version = "2.2"
 
