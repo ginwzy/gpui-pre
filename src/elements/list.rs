@@ -456,16 +456,27 @@ impl ListState {
         // Slicing the declared range out and iterating it avoids counting
         // every item on the way.
         let replaced = cursor.slice(&Count(start + heights.len()), Bias::Right);
-        let measure = heights[..replaced.summary().count]
-            .iter()
-            .any(Option::is_none);
-        new_items.extend(
-            replaced
-                .iter()
-                .zip(heights)
-                .map(|(item, height)| ListItem::new(height, item.focus_handle())),
-            (),
-        );
+        let count = replaced.summary().count;
+        let measure = heights[..count].iter().any(Option::is_none);
+        // Without focus handles to carry over, the replaced items need not be
+        // visited: a whole document's heights arrive at once when it opens.
+        if replaced.summary().has_focus_handles {
+            new_items.extend(
+                replaced
+                    .iter()
+                    .zip(heights)
+                    .map(|(item, height)| ListItem::new(height, item.focus_handle())),
+                (),
+            );
+        } else {
+            new_items.extend(
+                heights
+                    .into_iter()
+                    .take(count)
+                    .map(|height| ListItem::new(height, None)),
+                (),
+            );
+        }
         new_items.append(cursor.suffix(), ());
         drop(cursor);
         state.items = new_items;
