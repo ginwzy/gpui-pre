@@ -610,6 +610,13 @@ impl ListState {
             let mut cursor = state.items.cursor::<Count>(());
             let mut new_items = cursor.slice(&Count(range.start), Bias::Right);
             let invalidated = cursor.slice(&Count(range.end), Bias::Right);
+            // Only measurements and size hints change. A range of declared or
+            // never-measured items stays as it is, without visiting it.
+            if !invalidated.summary().has_width_bound_height {
+                drop(cursor);
+                state.measuring_behavior.reset();
+                return;
+            }
             new_items.extend(
                 invalidated.iter().map(|item| match item {
                     ListItem::Declared { .. } => item.clone(),
