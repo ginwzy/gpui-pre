@@ -301,6 +301,57 @@ impl PreparedListItems {
     }
 }
 
+/// Items for `heights` without focus handles. A long run of one height
+/// shares its subtrees, so a uniform document's heights cost a handful of
+/// nodes instead of one per item.
+fn declared_items(heights: &[Option<Pixels>]) -> SumTree<ListItem> {
+    const LONG_RUN: usize = 64;
+    let mut items = SumTree::default();
+    let mut pending = 0;
+    let mut ix = 0;
+    while ix < heights.len() {
+        let height = heights[ix];
+        let run = heights[ix..].iter().take_while(|h| **h == height).count();
+        if run >= LONG_RUN {
+            items.extend(
+                heights[pending..ix]
+                    .iter()
+                    .map(|height| ListItem::new(*height, None)),
+                (),
+            );
+            items.append(repeated_items(ListItem::new(height, None), run), ());
+            pending = ix + run;
+        }
+        ix += run;
+    }
+    items.extend(
+        heights[pending..]
+            .iter()
+            .map(|height| ListItem::new(*height, None)),
+        (),
+    );
+    items
+}
+
+/// `count` copies of `item`, built by doubling one full leaf. The copies
+/// share nodes, which the persistent tree copies only where it is edited.
+fn repeated_items(item: ListItem, count: usize) -> SumTree<ListItem> {
+    let leaf = 2 * sum_tree::TREE_BASE;
+    let mut items = SumTree::from_iter(std::iter::repeat_n(item.clone(), count % leaf), ());
+    let mut blocks = count / leaf;
+    let mut block = SumTree::from_iter(std::iter::repeat_n(item, leaf), ());
+    while blocks > 0 {
+        if blocks & 1 == 1 {
+            items.append(block.clone(), ());
+        }
+        blocks >>= 1;
+        if blocks > 0 {
+            block.append(block.clone(), ());
+        }
+    }
+    items
+}
+
 impl ListItem {
     fn new(height: Option<Pixels>, focus_handle: Option<FocusHandle>) -> Self {
         match height {
@@ -433,12 +484,8 @@ impl ListState {
         old_range: Range<usize>,
         heights: impl IntoIterator<Item = Option<Pixels>>,
     ) {
-        self.splice_items(
-            old_range,
-            heights
-                .into_iter()
-                .map(|height| ListItem::new(height, None)),
-        );
+        let heights: Vec<_> = heights.into_iter().collect();
+        self.splice_prepared(old_range, PreparedListItems(declared_items(&heights)));
     }
 
     /// Declare the heights of the items from `start` on, one for each entry of
@@ -469,13 +516,7 @@ impl ListState {
                 (),
             );
         } else {
-            new_items.extend(
-                heights
-                    .into_iter()
-                    .take(count)
-                    .map(|height| ListItem::new(height, None)),
-                (),
-            );
+            new_items.append(declared_items(&heights[..count]), ());
         }
         new_items.append(cursor.suffix(), ());
         drop(cursor);
@@ -661,7 +702,14 @@ impl ListState {
     /// Inform the list state that the items in `old_range` have been replaced
     /// by `count` new items that must be recalculated.
     pub fn splice(&self, old_range: Range<usize>, count: usize) {
-        self.splice_focusable(old_range, (0..count).map(|_| None))
+        let unmeasured = ListItem::Unmeasured {
+            size_hint: None,
+            focus_handle: None,
+        };
+        self.splice_prepared(
+            old_range,
+            PreparedListItems(repeated_items(unmeasured, count)),
+        );
     }
 
     /// Register with the list state that the items in `old_range` have been replaced
@@ -1911,7 +1959,9 @@ mod test {
     use gpui::{ScrollDelta, ScrollWheelEvent};
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
+    use sum_tree::{Bias, SumTree};
 
+    use super::{Count, ListItem, declared_items, repeated_items};
     use crate::{
         self as gpui, AppContext, Bounds, Context, Element, FollowMode, InteractiveElement,
         IntoElement, ListOffset, ListState, PreparedListItems, Render, Styled, TestAppContext,
@@ -2379,6 +2429,47 @@ mod test {
         assert_eq!(state.max_offset_for_scrollbar().y, px(10_180. - 50.));
         let top = state.logical_scroll_top();
         assert_eq!((top.item_ix, top.offset_in_item), (900, px(5.)));
+    }
+
+    #[test]
+    fn test_shared_declared_heights_match_items_built_one_by_one() {
+        let heights_of = |items: &SumTree<ListItem>| {
+            items
+                .iter()
+                .map(|item| item.size().map(|size| size.height))
+                .collect::<Vec<_>>()
+        };
+        for count in [0, 1, 63, 64, 65, 100, 1000, 1027] {
+            let mut heights: Vec<_> = (0..count)
+                .map(|ix| if ix % 400 == 7 { None } else { Some(px(10.)) })
+                .collect();
+            heights.extend([Some(px(20.)); 70]);
+            let mut shared = declared_items(&heights);
+            let one_by_one: SumTree<ListItem> = SumTree::from_iter(
+                heights.iter().map(|height| ListItem::new(*height, None)),
+                (),
+            );
+            assert_eq!(heights_of(&shared), heights_of(&one_by_one));
+            assert_eq!(shared.summary().height, one_by_one.summary().height);
+
+            // Editing one copy leaves the copies sharing its nodes as they were.
+            if count > 0 {
+                let mut cursor = shared.cursor::<Count>(());
+                let mut edited = cursor.slice(&Count(count / 2), Bias::Right);
+                cursor.next();
+                edited.push(ListItem::new(Some(px(99.)), None), ());
+                edited.append(cursor.suffix(), ());
+                drop(cursor);
+                shared = edited;
+                heights[count / 2] = Some(px(99.));
+                assert_eq!(heights_of(&shared), heights);
+            }
+        }
+        let unmeasured = ListItem::Unmeasured {
+            size_hint: None,
+            focus_handle: None,
+        };
+        assert_eq!(repeated_items(unmeasured, 5000).summary().count, 5000);
     }
 
     #[gpui::test]
