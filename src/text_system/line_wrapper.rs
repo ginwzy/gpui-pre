@@ -1,5 +1,6 @@
+use super::line_layout::GenerationCache;
 use crate::{FontId, FontRun, Pixels, SharedString, TextRun, TextSystem, displayed_cluster, px};
-use collections::{FxHashMap, HashMap};
+use collections::HashMap;
 use std::{borrow::Cow, iter, sync::Arc};
 use unicode_segmentation::UnicodeSegmentation as _;
 
@@ -26,15 +27,11 @@ pub struct LineWrapper {
 
 // Final results avoid repeating candidate allocation/search on every animation
 // redraw. This belongs to TextSystem, so pooled UI/background wrappers share it.
-#[derive(Default)]
-pub(super) struct TruncationCache {
-    current: FxHashMap<TruncationKey, (SharedString, Vec<TextRun>)>,
-    previous: FxHashMap<TruncationKey, (SharedString, Vec<TextRun>)>,
-    bytes: usize,
-}
+pub(super) type TruncationCache =
+    GenerationCache<TruncationKey, (SharedString, Vec<TextRun>), 512, { 1024 * 1024 }>;
 
 #[derive(PartialEq, Eq, Hash)]
-struct TruncationKey {
+pub(super) struct TruncationKey {
     source: SharedString,
     runs: Vec<TextRun>,
     font: FontId,
@@ -42,27 +39,6 @@ struct TruncationKey {
     width: Pixels,
     affix: String,
     direction: TruncateFrom,
-}
-
-impl TruncationCache {
-    fn insert(&mut self, key: TruncationKey, result: (SharedString, Vec<TextRun>)) {
-        let bytes = key.source.len()
-            + result.0.len()
-            + key.affix.len()
-            + (key.runs.len() + result.1.len()) * std::mem::size_of::<TextRun>();
-        const MAX_BYTES: usize = 1024 * 1024;
-        if bytes > MAX_BYTES / 8 {
-            return;
-        }
-        if self.current.len() >= 512 || self.bytes + bytes > MAX_BYTES {
-            std::mem::swap(&mut self.current, &mut self.previous);
-            self.current.clear();
-            self.bytes = 0;
-        }
-        // Replacements may over-account until rotation, which only evicts early.
-        self.bytes += bytes;
-        self.current.insert(key, result);
-    }
 }
 
 impl LineWrapper {
@@ -305,11 +281,8 @@ impl LineWrapper {
             affix: truncation_affix.to_owned(),
             direction: truncate_from,
         };
-        {
-            let cache = self.text_system.truncations.lock();
-            if let Some(hit) = cache.current.get(&key).or_else(|| cache.previous.get(&key)) {
-                return (hit.0.clone(), Cow::Owned(hit.1.clone()));
-            }
+        if let Some((shown, runs)) = self.text_system.truncations.lock().get(&key) {
+            return (shown, Cow::Owned(runs));
         }
         if line.is_empty() || self.shaped_text_width(&line, runs) <= truncate_width {
             return (line, Cow::Borrowed(runs));
@@ -368,39 +341,20 @@ impl LineWrapper {
                 high = mid - 1;
             }
         }
+        let bytes = key.source.len()
+            + best.0.len()
+            + key.affix.len()
+            + (key.runs.len() + best.1.len()) * std::mem::size_of::<TextRun>();
         self.text_system
             .truncations
             .lock()
-            .insert(key, best.clone());
+            .insert(key, best.clone(), bytes);
         (best.0, Cow::Owned(best.1))
     }
 
     fn shaped_text_width(&self, text: &str, runs: &[TextRun]) -> Pixels {
-        let mut fonts: Vec<FontRun> = Vec::new();
-        let mut previous: Option<&TextRun> = None;
-        for run in runs {
-            if run.len == 0 {
-                continue;
-            }
-            let font_id = self.text_system.resolve_font(&run.font);
-            let same_decoration = previous.is_some_and(|old| {
-                old.color == run.color
-                    && old.underline == run.underline
-                    && old.strikethrough == run.strikethrough
-            });
-            previous = Some(run);
-            if let Some(last) = fonts.last_mut()
-                && last.font_id == font_id
-                && same_decoration
-            {
-                last.len += run.len;
-            } else {
-                fonts.push(FontRun {
-                    len: run.len,
-                    font_id,
-                });
-            }
-        }
+        let mut fonts = Vec::new();
+        self.text_system.push_font_runs(runs, &mut fonts);
         if fonts.is_empty() {
             fonts.push(FontRun {
                 len: text.len(),
@@ -908,7 +862,7 @@ mod tests {
                 .text_system
                 .measurements
                 .lock()
-                .get(&source, wrapper.font_size, &fonts)
+                .measurement(&source, wrapper.font_size, &fonts)
                 .is_some()
         };
         // Drop only measurement entries: a final-result hit must not shape again.

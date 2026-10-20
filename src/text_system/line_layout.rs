@@ -480,35 +480,82 @@ impl WrappedLineLayout {
     }
 }
 
-/// Two bounded generations for measurements outside a window's frame lifecycle.
-/// Keys include the complete text and font runs; hash collisions cannot alias.
-#[derive(Default)]
-pub(super) struct MeasurementCache {
-    current: FxHashMap<Arc<CacheKey>, Arc<LineLayout>>,
-    previous: FxHashMap<Arc<CacheKey>, Arc<LineLayout>>,
+/// Two bounded generations for results retained outside a window's frame
+/// lifecycle. A full generation rotates into `previous`; hits there move back,
+/// so a working set that is still in use survives rotation.
+pub(super) struct GenerationCache<K, V, const ENTRIES: usize, const BYTES: usize> {
+    current: FxHashMap<K, (V, usize)>,
+    previous: FxHashMap<K, (V, usize)>,
     bytes: usize,
 }
 
-impl MeasurementCache {
-    const MAX_ENTRIES: usize = 512;
-    const MAX_BYTES: usize = 2 * 1024 * 1024;
+impl<K, V, const ENTRIES: usize, const BYTES: usize> Default
+    for GenerationCache<K, V, ENTRIES, BYTES>
+{
+    fn default() -> Self {
+        Self {
+            current: FxHashMap::default(),
+            previous: FxHashMap::default(),
+            bytes: 0,
+        }
+    }
+}
 
-    pub fn get(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> Option<Arc<LineLayout>> {
-        let key = &CacheKeyRef {
+impl<K: Hash + Eq, V: Clone, const ENTRIES: usize, const BYTES: usize>
+    GenerationCache<K, V, ENTRIES, BYTES>
+{
+    pub fn get<Q: Hash + Eq + ?Sized>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+    {
+        if let Some((value, _)) = self.current.get(key) {
+            return Some(value.clone());
+        }
+        let (key, (value, bytes)) = self.previous.remove_entry(key)?;
+        self.insert(key, value.clone(), bytes);
+        Some(value)
+    }
+
+    /// `bytes` estimates the retained size. A pathological entry is not cached,
+    /// so it cannot evict the entire useful working set.
+    pub fn insert(&mut self, key: K, value: V, bytes: usize) {
+        if bytes > BYTES / 8 {
+            return;
+        }
+        if let Some((_, replaced)) = self.current.remove(&key) {
+            self.bytes -= replaced;
+        }
+        if self.current.len() >= ENTRIES || self.bytes + bytes > BYTES {
+            self.previous = std::mem::take(&mut self.current);
+            self.bytes = 0;
+        }
+        self.bytes += bytes;
+        self.current.insert(key, (value, bytes));
+    }
+}
+
+/// Keys include the complete text and font runs; hash collisions cannot alias.
+pub(super) type MeasurementCache =
+    GenerationCache<Arc<CacheKey>, Arc<LineLayout>, 512, { 2 * 1024 * 1024 }>;
+
+impl MeasurementCache {
+    pub fn measurement(
+        &mut self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+    ) -> Option<Arc<LineLayout>> {
+        self.get(&CacheKeyRef {
             text,
             font_size,
             runs,
             wrap_width: None,
             force_width: None,
             indent: LineIndent::default(),
-        } as &dyn AsCacheKeyRef;
-        self.current
-            .get(key)
-            .or_else(|| self.previous.get(key))
-            .cloned()
+        } as &dyn AsCacheKeyRef)
     }
 
-    pub fn insert(
+    pub fn insert_measurement(
         &mut self,
         text: &str,
         font_size: Pixels,
@@ -523,27 +570,15 @@ impl MeasurementCache {
                 .map(|run| run.glyphs.capacity() * std::mem::size_of::<ShapedGlyph>())
                 .sum::<usize>()
             + layout.runs.capacity() * std::mem::size_of::<ShapedRun>();
-        // A pathological input must not evict the entire useful working set.
-        if bytes > Self::MAX_BYTES / 8 || self.get(text, font_size, runs).is_some() {
-            return;
-        }
-        if self.current.len() >= Self::MAX_ENTRIES || self.bytes + bytes > Self::MAX_BYTES {
-            std::mem::swap(&mut self.current, &mut self.previous);
-            self.current.clear();
-            self.bytes = 0;
-        }
-        self.bytes += bytes;
-        self.current.insert(
-            Arc::new(CacheKey {
-                text: text.to_owned().into(),
-                font_size,
-                runs: SmallVec::from(runs),
-                wrap_width: None,
-                force_width: None,
-                indent: LineIndent::default(),
-            }),
-            layout,
-        );
+        let key = Arc::new(CacheKey {
+            text: text.to_owned().into(),
+            font_size,
+            runs: SmallVec::from(runs),
+            wrap_width: None,
+            force_width: None,
+            indent: LineIndent::default(),
+        });
+        self.insert(key, layout, bytes);
     }
 }
 
@@ -989,7 +1024,7 @@ trait AsCacheKeyRef {
 }
 
 #[derive(Clone, Debug, Eq)]
-struct CacheKey {
+pub(super) struct CacheKey {
     text: SharedString,
     font_size: Pixels,
     runs: SmallVec<[FontRun; 1]>,
@@ -1131,6 +1166,29 @@ impl AsCacheKeyRef for CacheKeyRef<'_> {
 mod tests {
     use super::*;
     use crate::GlyphId;
+
+    #[test]
+    fn generation_cache_keeps_hits_across_rotation_and_bounds_bytes() {
+        let mut cache = GenerationCache::<u32, u32, 2, 64>::default();
+        cache.insert(1, 10, 1);
+        cache.insert(2, 20, 1);
+        // Rotation keeps the full generation reachable for one more round.
+        cache.insert(3, 30, 1);
+        assert_eq!(cache.get(&1), Some(10));
+        // 1 moved back to the current generation; 2 was not used and expires.
+        cache.insert(4, 40, 1);
+        assert_eq!(cache.get(&1), Some(10));
+        assert_eq!(cache.get(&2), None);
+        // An oversized entry is never retained.
+        cache.insert(5, 50, 64 / 8 + 1);
+        assert_eq!(cache.get(&5), None);
+        // Replacing an entry does not double-count its bytes.
+        for _ in 0..8 {
+            cache.insert(1, 11, 8);
+        }
+        assert_eq!(cache.get(&1), Some(11));
+        assert_eq!(cache.get(&3), Some(30));
+    }
 
     fn glyph_at(x: f32, index: usize) -> ShapedGlyph {
         ShapedGlyph {

@@ -112,7 +112,7 @@ impl TextSystem {
     // Background wrapping cannot use a window's frame/paint cache. Retain a
     // bounded set of the same immutable layouts independently of frame lifetime.
     fn measure_line(&self, text: &str, size: Pixels, runs: &[FontRun]) -> Arc<LineLayout> {
-        if let Some(layout) = self.measurements.lock().get(text, size, runs) {
+        if let Some(layout) = self.measurements.lock().measurement(text, size, runs) {
             return layout;
         }
         // Do not hold the shared cache lock while calling a platform shaper.
@@ -124,8 +124,37 @@ impl TextSystem {
         ));
         self.measurements
             .lock()
-            .insert(text, size, runs, layout.clone());
+            .insert_measurement(text, size, runs, layout.clone());
         layout
+    }
+
+    /// Group text runs the way painting shapes them: adjacent runs share a
+    /// shaped run only when font and glyph-affecting decoration both match.
+    /// Background color does not affect glyphs and never splits a run.
+    pub(crate) fn push_font_runs(&self, runs: &[TextRun], font_runs: &mut Vec<FontRun>) {
+        let mut last_run = None::<&TextRun>;
+        for run in runs {
+            let decoration_changed = !last_run.is_some_and(|last_run| {
+                last_run.color == run.color
+                    && last_run.underline == run.underline
+                    && last_run.strikethrough == run.strikethrough
+            });
+            if decoration_changed {
+                last_run = Some(run);
+            }
+            let font_id = self.resolve_font(&run.font);
+            if let Some(font_run) = font_runs.last_mut()
+                && font_id == font_run.font_id
+                && !decoration_changed
+            {
+                font_run.len += run.len;
+            } else {
+                font_runs.push(FontRun {
+                    len: run.len,
+                    font_id,
+                });
+            }
+        }
     }
 
     /// Get the FontId for the configure font family and style.
@@ -734,37 +763,9 @@ impl WindowTextSystem {
         runs: &[TextRun],
         force_width: Option<Pixels>,
     ) -> Arc<LineLayout> {
-        let mut last_run = None::<&TextRun>;
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
         font_runs.clear();
-
-        for run in runs.iter() {
-            let decoration_changed = if let Some(last_run) = last_run
-                && last_run.color == run.color
-                && last_run.underline == run.underline
-                && last_run.strikethrough == run.strikethrough
-            // we do not consider differing background color relevant, as it does not affect glyphs
-            // && last_run.background_color == run.background_color
-            {
-                false
-            } else {
-                last_run = Some(run);
-                true
-            };
-
-            let font_id = self.resolve_font(&run.font);
-            if let Some(font_run) = font_runs.last_mut()
-                && font_id == font_run.font_id
-                && !decoration_changed
-            {
-                font_run.len += run.len;
-            } else {
-                font_runs.push(FontRun {
-                    len: run.len,
-                    font_id,
-                });
-            }
-        }
+        self.push_font_runs(runs, &mut font_runs);
 
         let layout = self.line_layout_cache.layout_line(
             &SharedString::new(text),
@@ -816,37 +817,9 @@ impl WindowTextSystem {
         runs: &[TextRun],
         force_width: Option<Pixels>,
     ) -> Option<Arc<LineLayout>> {
-        let mut last_run = None::<&TextRun>;
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
         font_runs.clear();
-
-        for run in runs.iter() {
-            let decoration_changed = if let Some(last_run) = last_run
-                && last_run.color == run.color
-                && last_run.underline == run.underline
-                && last_run.strikethrough == run.strikethrough
-            // we do not consider differing background color relevant, as it does not affect glyphs
-            // && last_run.background_color == run.background_color
-            {
-                false
-            } else {
-                last_run = Some(run);
-                true
-            };
-
-            let font_id = self.resolve_font(&run.font);
-            if let Some(font_run) = font_runs.last_mut()
-                && font_id == font_run.font_id
-                && !decoration_changed
-            {
-                font_run.len += run.len;
-            } else {
-                font_runs.push(FontRun {
-                    len: run.len,
-                    font_id,
-                });
-            }
-        }
+        self.push_font_runs(runs, &mut font_runs);
 
         let layout = self.line_layout_cache.try_layout_line_by_hash(
             text_hash,
@@ -878,37 +851,9 @@ impl WindowTextSystem {
         force_width: Option<Pixels>,
         materialize_text: impl FnOnce() -> SharedString,
     ) -> Arc<LineLayout> {
-        let mut last_run = None::<&TextRun>;
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
         font_runs.clear();
-
-        for run in runs.iter() {
-            let decoration_changed = if let Some(last_run) = last_run
-                && last_run.color == run.color
-                && last_run.underline == run.underline
-                && last_run.strikethrough == run.strikethrough
-            // we do not consider differing background color relevant, as it does not affect glyphs
-            // && last_run.background_color == run.background_color
-            {
-                false
-            } else {
-                last_run = Some(run);
-                true
-            };
-
-            let font_id = self.resolve_font(&run.font);
-            if let Some(font_run) = font_runs.last_mut()
-                && font_id == font_run.font_id
-                && !decoration_changed
-            {
-                font_run.len += run.len;
-            } else {
-                font_runs.push(FontRun {
-                    len: run.len,
-                    font_id,
-                });
-            }
-        }
+        self.push_font_runs(runs, &mut font_runs);
 
         let layout = self.line_layout_cache.layout_line_by_hash(
             text_hash,
