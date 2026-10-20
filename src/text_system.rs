@@ -58,6 +58,8 @@ pub struct TextSystem {
     raster_bounds: RwLock<FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>>,
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
     font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
+    measurements: Mutex<line_layout::MeasurementCache>,
+    truncations: Mutex<line_wrapper::TruncationCache>,
     fallback_font_stack: SmallVec<[Font; 2]>,
 }
 
@@ -71,6 +73,8 @@ impl TextSystem {
             font_ids_by_font: RwLock::default(),
             wrapper_pool: Mutex::default(),
             font_runs_pool: Mutex::default(),
+            measurements: Mutex::default(),
+            truncations: Mutex::default(),
             fallback_font_stack: smallvec![
                 // TODO: Remove this when Linux have implemented setting fallbacks.
                 font(".ZedMono"),
@@ -99,7 +103,29 @@ impl TextSystem {
 
     /// Add a font's data to the text system.
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
-        self.platform_text_system.add_fonts(fonts)
+        self.platform_text_system.add_fonts(fonts)?;
+        *self.measurements.lock() = Default::default();
+        *self.truncations.lock() = Default::default();
+        Ok(())
+    }
+
+    // Background wrapping cannot use a window's frame/paint cache. Retain a
+    // bounded set of the same immutable layouts independently of frame lifetime.
+    fn measure_line(&self, text: &str, size: Pixels, runs: &[FontRun]) -> Arc<LineLayout> {
+        if let Some(layout) = self.measurements.lock().get(text, size, runs) {
+            return layout;
+        }
+        // Do not hold the shared cache lock while calling a platform shaper.
+        let layout = Arc::new(layout_line_bounded(
+            self.platform_text_system.as_ref(),
+            text,
+            size,
+            runs,
+        ));
+        self.measurements
+            .lock()
+            .insert(text, size, runs, layout.clone());
+        layout
     }
 
     /// Get the FontId for the configure font family and style.
@@ -1042,7 +1068,7 @@ impl Display for FontStyle {
 }
 
 /// A styled run of text, for use in [`crate::TextLayout`].
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct TextRun {
     /// A number of utf8 bytes
     pub len: usize,

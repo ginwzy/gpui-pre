@@ -731,12 +731,9 @@ impl TextLayout {
                             .iter()
                             .all(|line| line.size(line_height).width <= truncate_width)
                     {
-                        // The truncation decision below sums per-character advances,
-                        // which overestimates the shaped width (no kerning), truncating
-                        // text that fits exactly in its measured width. Skip truncation
-                        // whenever the honestly-shaped text fits; the shaping result
-                        // comes from the line layout cache when the same text was
-                        // already measured untruncated this frame.
+                        // Reuse the cached unconstrained layout when every line
+                        // fits. Truncation otherwise shapes its complete candidate,
+                        // including the affix and the retained text runs.
                         (text.clone(), Cow::Borrowed(&*runs))
                     } else {
                         line_wrapper.truncate_line(

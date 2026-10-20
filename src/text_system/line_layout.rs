@@ -480,6 +480,73 @@ impl WrappedLineLayout {
     }
 }
 
+/// Two bounded generations for measurements outside a window's frame lifecycle.
+/// Keys include the complete text and font runs; hash collisions cannot alias.
+#[derive(Default)]
+pub(super) struct MeasurementCache {
+    current: FxHashMap<Arc<CacheKey>, Arc<LineLayout>>,
+    previous: FxHashMap<Arc<CacheKey>, Arc<LineLayout>>,
+    bytes: usize,
+}
+
+impl MeasurementCache {
+    const MAX_ENTRIES: usize = 512;
+    const MAX_BYTES: usize = 2 * 1024 * 1024;
+
+    pub fn get(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> Option<Arc<LineLayout>> {
+        let key = &CacheKeyRef {
+            text,
+            font_size,
+            runs,
+            wrap_width: None,
+            force_width: None,
+            indent: LineIndent::default(),
+        } as &dyn AsCacheKeyRef;
+        self.current
+            .get(key)
+            .or_else(|| self.previous.get(key))
+            .cloned()
+    }
+
+    pub fn insert(
+        &mut self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+        layout: Arc<LineLayout>,
+    ) {
+        let bytes = text.len()
+            + std::mem::size_of_val(runs)
+            + layout
+                .runs
+                .iter()
+                .map(|run| run.glyphs.capacity() * std::mem::size_of::<ShapedGlyph>())
+                .sum::<usize>()
+            + layout.runs.capacity() * std::mem::size_of::<ShapedRun>();
+        // A pathological input must not evict the entire useful working set.
+        if bytes > Self::MAX_BYTES / 8 || self.get(text, font_size, runs).is_some() {
+            return;
+        }
+        if self.current.len() >= Self::MAX_ENTRIES || self.bytes + bytes > Self::MAX_BYTES {
+            std::mem::swap(&mut self.current, &mut self.previous);
+            self.current.clear();
+            self.bytes = 0;
+        }
+        self.bytes += bytes;
+        self.current.insert(
+            Arc::new(CacheKey {
+                text: text.to_owned().into(),
+                font_size,
+                runs: SmallVec::from(runs),
+                wrap_width: None,
+                force_width: None,
+                indent: LineIndent::default(),
+            }),
+            layout,
+        );
+    }
+}
+
 pub(crate) struct LineLayoutCache {
     previous_frame: Mutex<FrameCache>,
     current_frame: RwLock<FrameCache>,

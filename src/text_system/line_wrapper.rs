@@ -1,6 +1,7 @@
-use crate::{FontId, Pixels, SharedString, TextRun, TextSystem, displayed_cluster, px};
-use collections::HashMap;
+use crate::{FontId, FontRun, Pixels, SharedString, TextRun, TextSystem, displayed_cluster, px};
+use collections::{FxHashMap, HashMap};
 use std::{borrow::Cow, iter, sync::Arc};
+use unicode_segmentation::UnicodeSegmentation as _;
 
 /// Determines whether to truncate text from the start or end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -23,9 +24,114 @@ pub struct LineWrapper {
     cached_cluster_widths: HashMap<String, Pixels>,
 }
 
+// Final results avoid repeating candidate allocation/search on every animation
+// redraw. This belongs to TextSystem, so pooled UI/background wrappers share it.
+#[derive(Default)]
+pub(super) struct TruncationCache {
+    current: FxHashMap<TruncationKey, (SharedString, Vec<TextRun>)>,
+    previous: FxHashMap<TruncationKey, (SharedString, Vec<TextRun>)>,
+    bytes: usize,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct TruncationKey {
+    source: SharedString,
+    runs: Vec<TextRun>,
+    font: FontId,
+    size: Pixels,
+    width: Pixels,
+    affix: String,
+    direction: TruncateFrom,
+}
+
+impl TruncationCache {
+    fn insert(&mut self, key: TruncationKey, result: (SharedString, Vec<TextRun>)) {
+        let bytes = key.source.len()
+            + result.0.len()
+            + key.affix.len()
+            + (key.runs.len() + result.1.len()) * std::mem::size_of::<TextRun>();
+        const MAX_BYTES: usize = 1024 * 1024;
+        if bytes > MAX_BYTES / 8 {
+            return;
+        }
+        if self.current.len() >= 512 || self.bytes + bytes > MAX_BYTES {
+            std::mem::swap(&mut self.current, &mut self.previous);
+            self.current.clear();
+            self.bytes = 0;
+        }
+        // Replacements may over-account until rotation, which only evicts early.
+        self.bytes += bytes;
+        self.current.insert(key, result);
+    }
+}
+
 impl LineWrapper {
     /// The maximum indent that can be applied to a line.
     pub const MAX_INDENT: u32 = 256;
+
+    /// Measure styled text with the same shaping used for painting. Run lengths
+    /// are UTF-8 bytes. Unlike independent cluster advances, this preserves
+    /// contextual punctuation spacing and kerning across font runs. Different
+    /// sizes are separate text elements and therefore shaped separately. Returns
+    /// the width and a suggested byte boundary from the shaped glyph positions.
+    /// The caller must round to a cluster boundary and revalidate changed context.
+    pub fn measure_runs<'a>(
+        text: &str,
+        runs: impl IntoIterator<Item = (usize, &'a LineWrapper)>,
+        max_width: Pixels,
+    ) -> (Pixels, usize) {
+        let mut width = px(0.);
+        let mut fit = text.len();
+        let mut measure = |wrapper: &LineWrapper, start: usize, end: usize, fonts: &[FontRun]| {
+            let layout =
+                wrapper
+                    .text_system
+                    .measure_line(&text[start..end], wrapper.font_size, fonts);
+            if fit == text.len() && width + layout.width > max_width {
+                fit = start
+                    + layout
+                        .index_for_x((max_width - width).max(px(0.)))
+                        .unwrap_or(0);
+            }
+            width += layout.width;
+        };
+        let mut start = 0;
+        let mut end = 0;
+        let mut fonts = Vec::new();
+        let mut previous: Option<&LineWrapper> = None;
+        for (len, wrapper) in runs {
+            if len == 0 {
+                continue;
+            }
+            if let Some(old) = previous
+                && old.font_size != wrapper.font_size
+            {
+                measure(old, start, end, &fonts);
+                fonts.clear();
+                start = end;
+            }
+            if let Some(FontRun {
+                len: last_len,
+                font_id,
+            }) = fonts.last_mut()
+                && *font_id == wrapper.font_id
+            {
+                *last_len += len;
+            } else {
+                fonts.push(FontRun {
+                    len,
+                    font_id: wrapper.font_id,
+                });
+            }
+            end += len;
+            previous = Some(wrapper);
+        }
+        if let Some(wrapper) = previous {
+            measure(wrapper, start, end, &fonts);
+        }
+        debug_assert_eq!(end, text.len());
+        (width, fit)
+    }
 
     pub(crate) fn new(font_id: FontId, font_size: Pixels, text_system: Arc<TextSystem>) -> Self {
         Self {
@@ -181,63 +287,6 @@ impl LineWrapper {
         None
     }
 
-    fn should_truncate_line_middle(
-        &mut self,
-        line: &str,
-        truncate_width: Pixels,
-        truncation_affix: &str,
-    ) -> Option<(usize, usize)> {
-        let suffix_width = truncation_affix
-            .chars()
-            .map(|c| self.width_for_char(c))
-            .fold(px(0.0), |a, x| a + x);
-
-        let total_width: Pixels = line
-            .chars()
-            .map(|c| self.width_for_char(c))
-            .fold(px(0.0), |a, x| a + x);
-
-        if total_width <= truncate_width {
-            return None;
-        }
-
-        let content_budget = truncate_width - suffix_width;
-        if content_budget <= px(0.) {
-            return Some((0, line.len()));
-        }
-
-        let front_budget = content_budget * (2.0 / 3.0);
-        let back_budget = content_budget - front_budget;
-
-        let mut front_width = px(0.);
-        let mut front_end_ix = 0usize;
-        for (ix, c) in line.char_indices() {
-            let char_width = self.width_for_char(c);
-            if front_width + char_width > front_budget {
-                break;
-            }
-            front_width += char_width;
-            front_end_ix = ix + c.len_utf8();
-        }
-
-        let mut back_width = px(0.);
-        let mut back_start_ix = line.len();
-        for (ix, c) in line.char_indices().rev() {
-            let char_width = self.width_for_char(c);
-            if back_width + char_width > back_budget {
-                break;
-            }
-            back_width += char_width;
-            back_start_ix = ix;
-        }
-
-        if front_end_ix >= back_start_ix {
-            return Some((0, line.len()));
-        }
-
-        Some((front_end_ix, back_start_ix))
-    }
-
     /// Truncate a line of text to the given width with this wrapper's font and font size.
     pub fn truncate_line<'a>(
         &mut self,
@@ -247,49 +296,120 @@ impl LineWrapper {
         runs: &'a [TextRun],
         truncate_from: TruncateFrom,
     ) -> (SharedString, Cow<'a, [TextRun]>) {
-        if truncate_from == TruncateFrom::Middle {
-            if let Some((front_end_ix, back_start_ix)) =
-                self.should_truncate_line_middle(&line, truncate_width, truncation_affix)
-            {
-                let result = SharedString::from(format!(
-                    "{}{truncation_affix}{}",
-                    &line[..front_end_ix],
-                    &line[back_start_ix..]
-                ));
-                let mut runs = runs.to_vec();
-                update_runs_after_middle_truncation(
-                    truncation_affix,
-                    &mut runs,
-                    front_end_ix,
-                    back_start_ix,
-                );
-                return (result, Cow::Owned(runs));
-            } else {
-                return (line, Cow::Borrowed(runs));
+        let key = TruncationKey {
+            source: line.clone(),
+            runs: runs.to_vec(),
+            font: self.font_id,
+            size: self.font_size,
+            width: truncate_width,
+            affix: truncation_affix.to_owned(),
+            direction: truncate_from,
+        };
+        {
+            let cache = self.text_system.truncations.lock();
+            if let Some(hit) = cache.current.get(&key).or_else(|| cache.previous.get(&key)) {
+                return (hit.0.clone(), Cow::Owned(hit.1.clone()));
             }
         }
-
-        if let Some(truncate_ix) =
-            self.should_truncate_line(&line, truncate_width, truncation_affix, truncate_from)
-        {
-            let result = match truncate_from {
-                TruncateFrom::Start => SharedString::from(format!(
-                    "{truncation_affix}{}",
-                    &line[line.ceil_char_boundary(truncate_ix + 1)..]
-                )),
-                TruncateFrom::End => SharedString::from(format!(
-                    "{}{truncation_affix}",
-                    line[..truncate_ix]
-                        .trim_end_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
-                )),
-                TruncateFrom::Middle => unreachable!("Middle truncation is handled above"),
-            };
-            let mut runs = runs.to_vec();
-            update_runs_after_truncation(&result, truncation_affix, &mut runs, truncate_from);
-            (result, Cow::Owned(runs))
-        } else {
-            (line, Cow::Borrowed(runs))
+        if line.is_empty() || self.shaped_text_width(&line, runs) <= truncate_width {
+            return (line, Cow::Borrowed(runs));
         }
+        // A character's isolated advance is not its contextual width (notably
+        // CJK punctuation in the macOS system font). Measure the complete
+        // candidate, with its affix and retained styles, at grapheme boundaries.
+        let boundaries: Vec<_> = iter::once(0)
+            .chain(
+                line.grapheme_indices(true)
+                    .map(|(ix, cluster)| ix + cluster.len()),
+            )
+            .collect();
+        let count = boundaries.len() - 1;
+        let candidate = |keep: usize| {
+            let mut adjusted = runs.to_vec();
+            let result: SharedString = match truncate_from {
+                TruncateFrom::End => {
+                    let prefix = line[..boundaries[keep]]
+                        .trim_end_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation());
+                    format!("{prefix}{truncation_affix}").into()
+                }
+                TruncateFrom::Start => {
+                    format!("{truncation_affix}{}", &line[boundaries[count - keep]..]).into()
+                }
+                TruncateFrom::Middle => {
+                    let front = (keep * 2).div_ceil(3);
+                    let from = boundaries[front];
+                    let to = boundaries[count - (keep - front)];
+                    let result: SharedString =
+                        format!("{}{truncation_affix}{}", &line[..from], &line[to..]).into();
+                    update_runs_after_middle_truncation(truncation_affix, &mut adjusted, from, to);
+                    result
+                }
+            };
+            if truncate_from != TruncateFrom::Middle {
+                update_runs_after_truncation(
+                    &result,
+                    truncation_affix,
+                    &mut adjusted,
+                    truncate_from,
+                );
+            }
+            (result, adjusted)
+        };
+        let mut best = candidate(0);
+        let mut low = 0;
+        let mut high = count - 1;
+        while low < high {
+            let mid = (low + high).div_ceil(2);
+            let next = candidate(mid);
+            if self.shaped_text_width(&next.0, &next.1) <= truncate_width {
+                low = mid;
+                best = next;
+            } else {
+                high = mid - 1;
+            }
+        }
+        self.text_system
+            .truncations
+            .lock()
+            .insert(key, best.clone());
+        (best.0, Cow::Owned(best.1))
+    }
+
+    fn shaped_text_width(&self, text: &str, runs: &[TextRun]) -> Pixels {
+        let mut fonts: Vec<FontRun> = Vec::new();
+        let mut previous: Option<&TextRun> = None;
+        for run in runs {
+            if run.len == 0 {
+                continue;
+            }
+            let font_id = self.text_system.resolve_font(&run.font);
+            let same_decoration = previous.is_some_and(|old| {
+                old.color == run.color
+                    && old.underline == run.underline
+                    && old.strikethrough == run.strikethrough
+            });
+            previous = Some(run);
+            if let Some(last) = fonts.last_mut()
+                && last.font_id == font_id
+                && same_decoration
+            {
+                last.len += run.len;
+            } else {
+                fonts.push(FontRun {
+                    len: run.len,
+                    font_id,
+                });
+            }
+        }
+        if fonts.is_empty() {
+            fonts.push(FontRun {
+                len: text.len(),
+                font_id: self.font_id,
+            });
+        }
+        self.text_system
+            .measure_line(text, self.font_size, &fonts)
+            .width
     }
 
     /// Truncate text to fit within a given number of wrapped lines.
@@ -770,6 +890,55 @@ mod tests {
                 ..Default::default()
             })
             .collect()
+    }
+
+    #[test]
+    fn repeated_truncation_reuses_results_but_not_stale_styles() {
+        let mut wrapper = build_wrapper();
+        let source: SharedString = "a fairly long title with styled text".into();
+        let mut runs = generate_test_runs(&[source.len()]);
+        let (expected, _) =
+            wrapper.truncate_line(source.clone(), px(72.), "…", &runs, TruncateFrom::End);
+        let fonts = [FontRun {
+            len: source.len(),
+            font_id: wrapper.text_system.resolve_font(&runs[0].font),
+        }];
+        let measured = || {
+            wrapper
+                .text_system
+                .measurements
+                .lock()
+                .get(&source, wrapper.font_size, &fonts)
+                .is_some()
+        };
+        // Drop only measurement entries: a final-result hit must not shape again.
+        *wrapper.text_system.measurements.lock() = Default::default();
+        let mut other = LineWrapper::new(
+            wrapper.font_id,
+            wrapper.font_size,
+            wrapper.text_system.clone(),
+        );
+        let (shown, _) =
+            other.truncate_line(source.clone(), px(72.), "…", &runs, TruncateFrom::End);
+        assert_eq!(shown, expected);
+        assert!(!measured());
+
+        let original_color = runs[0].color;
+        runs[0].color = crate::red();
+        let (shown, styled) =
+            other.truncate_line(source.clone(), px(72.), "…", &runs, TruncateFrom::End);
+        assert_eq!(shown, expected);
+        assert_eq!(styled[0].color, crate::red());
+        assert_eq!(styled.iter().map(|run| run.len).sum::<usize>(), shown.len());
+        assert!(measured());
+
+        // Both style variants must coexist, rather than evicting each other.
+        *wrapper.text_system.measurements.lock() = Default::default();
+        runs[0].color = original_color;
+        let (_, styled) =
+            other.truncate_line(source.clone(), px(72.), "…", &runs, TruncateFrom::End);
+        assert_eq!(styled[0].color, original_color);
+        assert!(!measured());
     }
 
     #[test]
