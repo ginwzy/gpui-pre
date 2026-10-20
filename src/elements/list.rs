@@ -73,6 +73,90 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
+    scroll_resolver: Option<ListScrollResolver>,
+}
+
+/// Decides the scroll top of each layout once every item is measured, before
+/// the visible items are laid out. See [`ListState::set_scroll_resolver`].
+pub type ListScrollResolver =
+    Rc<dyn Fn(&mut ListGeometry, &mut Window, &mut App) -> Option<ListOffset>>;
+
+/// The measured geometry of a list during layout, in content coordinates:
+/// y is measured from the top of the first item.
+pub struct ListGeometry<'a> {
+    state: &'a mut StateInner,
+    viewport_height: Pixels,
+}
+
+impl ListGeometry<'_> {
+    /// The number of items.
+    pub fn item_count(&self) -> usize {
+        self.state.items.summary().count
+    }
+
+    /// The height available to the items.
+    pub fn viewport_height(&self) -> Pixels {
+        self.viewport_height
+    }
+
+    /// The height of every item together.
+    pub fn content_height(&self) -> Pixels {
+        self.state.items.summary().height
+    }
+
+    /// The scroll top the list would lay out with.
+    pub fn scroll_top(&self) -> ListOffset {
+        self.state.logical_scroll_top()
+    }
+
+    /// The content y of `offset`.
+    pub fn y_for_offset(&self, offset: &ListOffset) -> Pixels {
+        self.state.scroll_top(offset)
+    }
+
+    /// The offset at content y `y`: the item that contains it, or the end.
+    pub fn offset_for_y(&self, y: Pixels) -> ListOffset {
+        let y = y.max(px(0.));
+        let (start, ..) = self
+            .state
+            .items
+            .find::<ListItemSummary, _>((), &Height(y), Bias::Right);
+        ListOffset {
+            item_ix: start.count,
+            offset_in_item: y - start.height,
+        }
+    }
+
+    /// The content y of item `ix`'s top, unless an earlier item has no height yet.
+    pub fn item_top(&self, ix: usize) -> Option<Pixels> {
+        let (start, ..) = self
+            .state
+            .items
+            .find::<ListItemSummary, _>((), &Count(ix), Bias::Right);
+        (!start.has_unknown_height).then_some(start.height)
+    }
+
+    /// Item `ix`'s height, once known.
+    pub fn item_height(&self, ix: usize) -> Option<Pixels> {
+        let (_, _, item) = self
+            .state
+            .items
+            .find::<ListItemSummary, _>((), &Count(ix), Bias::Right);
+        item.and_then(|item| item.size()).map(|size| size.height)
+    }
+
+    /// Declares item `ix`'s height for this layout and later ones.
+    pub fn set_item_height(&mut self, ix: usize, height: Pixels) {
+        let mut cursor = self.state.items.cursor::<Count>(());
+        let mut items = cursor.slice(&Count(ix), Bias::Right);
+        if let Some(item) = cursor.item() {
+            items.push(ListItem::new(Some(height), item.focus_handle()), ());
+            cursor.next();
+        }
+        items.append(cursor.suffix(), ());
+        drop(cursor);
+        self.state.items = items;
+    }
 }
 
 /// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
@@ -461,6 +545,7 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
             follow_state: FollowState::default(),
+            scroll_resolver: None,
         })));
         this.splice(0..0, item_count);
         this
@@ -769,6 +854,15 @@ impl ListState {
             }
         }
         PreparedListItems(removed)
+    }
+
+    /// Lets `resolver` decide the scroll top of every layout. It runs once all
+    /// items are measured and before the visible ones are laid out, including
+    /// a second layout for a child's autoscroll request; `None` keeps the
+    /// list's own scroll top. The list is borrowed meanwhile: the resolver
+    /// reads and adjusts it only through [`ListGeometry`].
+    pub fn set_scroll_resolver(&self, resolver: Option<ListScrollResolver>) {
+        self.0.borrow_mut().scroll_resolver = resolver;
     }
 
     /// Set a handler that will be called when the list is scrolled.
@@ -1485,6 +1579,18 @@ impl StateInner {
                     self.layout_all_items(bounds.size.width, render_item, window, cx);
                 }
                 _ => {}
+            }
+
+            if let Some(resolver) = self.scroll_resolver.clone() {
+                let viewport_height = bounds.size.height - padding.top - padding.bottom;
+                let mut geometry = ListGeometry {
+                    state: self,
+                    viewport_height,
+                };
+                if let Some(scroll_top) = resolver(&mut geometry, window, cx) {
+                    self.pending_scroll = None;
+                    self.logical_scroll_top = Some(scroll_top);
+                }
             }
 
             let mut layout_response = self.layout_items(
