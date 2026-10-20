@@ -73,6 +73,15 @@ pub trait EntityInputHandler: 'static + Sized {
         cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>>;
 
+    /// See [`InputHandler::ime_candidate_bounds`] for details.
+    fn ime_candidate_bounds(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        None
+    }
+
     /// See [`InputHandler::character_index_for_point`] for details
     fn character_index_for_point(
         &mut self,
@@ -221,6 +230,15 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
         self.view.update(cx, |view, cx| {
             view.bounds_for_range(range_utf16, self.element_bounds, window, cx)
         })
+    }
+
+    fn ime_candidate_bounds(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        self.view
+            .update(cx, |view, cx| view.ime_candidate_bounds(window, cx))
     }
 
     fn character_index_for_point(

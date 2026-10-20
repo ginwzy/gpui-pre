@@ -1680,6 +1680,9 @@ impl PlatformInputHandler {
     }
 
     pub fn selected_bounds(&mut self, window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
+        if let Some(bounds) = self.handler.ime_candidate_bounds(window, cx) {
+            return Some(bounds);
+        }
         let marked_range = self.handler.marked_text_range(window, cx);
         let selection = self.handler.selected_text_range(true, window, cx)?;
         Self::compute_ime_candidate_bounds(marked_range, &selection, |range| {
@@ -1688,6 +1691,14 @@ impl PlatformInputHandler {
     }
 
     pub fn ime_candidate_bounds(&mut self) -> Option<Bounds<Pixels>> {
+        if let Some(bounds) = self
+            .cx
+            .update(|window, cx| self.handler.ime_candidate_bounds(window, cx))
+            .ok()
+            .flatten()
+        {
+            return Some(bounds);
+        }
         let marked_range = self.marked_text_range();
         let selection = self.selected_text_range(true)?;
         Self::compute_ime_candidate_bounds(marked_range, &selection, |range| {
@@ -1873,6 +1884,17 @@ pub trait InputHandler: 'static {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Bounds<Pixels>>;
+
+    /// Override the candidate anchor for controls with a local composition overlay.
+    /// Called after paint by the window's normal IME synchronization. Returning
+    /// `None` keeps the default marked-line-start/selection-endpoint policy.
+    fn ime_candidate_bounds(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        None
+    }
 
     /// Get the character offset for the given point in terms of UTF16 characters
     ///
