@@ -129,20 +129,12 @@ impl ListGeometry<'_> {
 
     /// The content y of item `ix`'s top, unless an earlier item has no height yet.
     pub fn item_top(&self, ix: usize) -> Option<Pixels> {
-        let (start, ..) = self
-            .state
-            .items
-            .find::<ListItemSummary, _>((), &Count(ix), Bias::Right);
-        (!start.has_unknown_height).then_some(start.height)
+        self.state.item_top(ix)
     }
 
     /// Item `ix`'s height, once known.
     pub fn item_height(&self, ix: usize) -> Option<Pixels> {
-        let (_, _, item) = self
-            .state
-            .items
-            .find::<ListItemSummary, _>((), &Count(ix), Bias::Right);
-        item.and_then(|item| item.size()).map(|size| size.height)
+        self.state.item_height(ix)
     }
 
     /// Declares item `ix`'s height for this layout and later ones.
@@ -1023,6 +1015,17 @@ impl ListState {
         state.logical_scroll_top = Some(scroll_top);
     }
 
+    /// The content y of item `ix`'s top, measured from the first item, unless
+    /// an earlier item has no height yet.
+    pub fn item_top(&self, ix: usize) -> Option<Pixels> {
+        self.0.borrow().item_top(ix)
+    }
+
+    /// Item `ix`'s height, once known.
+    pub fn item_height(&self, ix: usize) -> Option<Pixels> {
+        self.0.borrow().item_height(ix)
+    }
+
     /// Get the bounds for the given item in window coordinates, if it's
     /// been rendered.
     pub fn bounds_for_item(&self, ix: usize) -> Option<Bounds<Pixels>> {
@@ -1288,6 +1291,20 @@ impl StateInner {
                     offset_in_item: px(0.),
                 },
             })
+    }
+
+    fn item_top(&self, ix: usize) -> Option<Pixels> {
+        let (start, ..) = self
+            .items
+            .find::<ListItemSummary, _>((), &Count(ix), Bias::Right);
+        (!start.has_unknown_height).then_some(start.height)
+    }
+
+    fn item_height(&self, ix: usize) -> Option<Pixels> {
+        let (_, _, item) = self
+            .items
+            .find::<ListItemSummary, _>((), &Count(ix), Bias::Right);
+        item.and_then(|item| item.size()).map(|size| size.height)
     }
 
     fn scroll_top(&self, logical_scroll_top: &ListOffset) -> Pixels {
