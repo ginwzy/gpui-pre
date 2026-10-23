@@ -1,3 +1,5 @@
+mod wrap;
+
 use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
 use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
@@ -9,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use super::{LineWrapper, layout_line_bounded};
+use super::layout_line_bounded;
 
 /// A laid out and styled line of text
 #[derive(Default, Debug)]
@@ -186,98 +188,38 @@ impl LineLayout {
 
         (left, right)
     }
-
-    fn compute_wrap_boundaries(
-        &self,
-        text: &str,
-        wrap_width: Pixels,
-        max_lines: Option<usize>,
-        indent: LineIndent,
-    ) -> SmallVec<[WrapBoundary; 1]> {
-        let mut boundaries = SmallVec::new();
-        let mut first_non_whitespace_ix = None;
-        let mut last_candidate_ix = None;
-        let mut last_candidate_x = px(0.);
-        let mut last_boundary = WrapBoundary {
-            run_ix: 0,
-            glyph_ix: 0,
-        };
-        let mut last_boundary_x = px(0.);
-        let mut prev_ch = '\0';
-        let mut glyphs = self
-            .runs
-            .iter()
-            .enumerate()
-            .flat_map(move |(run_ix, run)| {
-                run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
-                    let character = text[glyph.index..].chars().next().unwrap();
-                    (
-                        WrapBoundary { run_ix, glyph_ix },
-                        character,
-                        glyph.position.x,
-                    )
-                })
-            })
-            .peekable();
-
-        while let Some((boundary, ch, x)) = glyphs.next() {
-            if ch == '\n' {
-                continue;
-            }
-
-            // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
-            // but there are some differences, so we have to duplicate the code here.
-            if LineWrapper::can_break_before(prev_ch, ch) && first_non_whitespace_ix.is_some() {
-                last_candidate_ix = Some(boundary);
-                last_candidate_x = x;
-            }
-
-            if ch != ' ' && first_non_whitespace_ix.is_none() {
-                first_non_whitespace_ix = Some(boundary);
-            }
-
-            let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
-            let width = next_x - last_boundary_x;
-
-            let row_width = wrap_width - indent.for_row(boundaries.len());
-            if width > row_width && boundary > last_boundary {
-                // When used line_clamp, we should limit the number of lines.
-                if let Some(max_lines) = max_lines
-                    && boundaries.len() >= max_lines.saturating_sub(1)
-                {
-                    break;
-                }
-
-                if let Some(last_candidate_ix) = last_candidate_ix.take() {
-                    last_boundary = last_candidate_ix;
-                    last_boundary_x = last_candidate_x;
-                } else {
-                    last_boundary = boundary;
-                    last_boundary_x = x;
-                }
-                boundaries.push(last_boundary);
-            }
-            prev_ch = ch;
-        }
-
-        boundaries
-    }
 }
 
 /// A line of text that has been wrapped to fit a given width
 #[derive(Default, Debug)]
 pub struct WrappedLineLayout {
-    /// The line layout, pre-wrapping.
-    pub unwrapped_layout: Arc<LineLayout>,
-
-    /// The boundaries at which the line was wrapped
-    pub wrap_boundaries: SmallVec<[WrapBoundary; 1]>,
+    rows: SmallVec<[ShapedRow; 1]>,
 
     /// The width of the line, if it was wrapped
     pub wrap_width: Option<Pixels>,
 
     /// How far each row is inset from the line's origin
     pub indent: LineIndent,
+}
+
+/// A display row shaped in its final line context. Glyph indices are local to
+/// this row; `range` maps them back to the original, unmodified text.
+#[derive(Debug)]
+pub struct ShapedRow {
+    range: Range<usize>,
+    layout: Arc<LineLayout>,
+}
+
+impl ShapedRow {
+    /// This row's UTF-8 byte range in the original text.
+    pub fn range(&self) -> Range<usize> {
+        self.range.clone()
+    }
+
+    /// The geometry shared by drawing, measurement and hit testing.
+    pub fn layout(&self) -> &Arc<LineLayout> {
+        &self.layout
+    }
 }
 
 /// Horizontal insets for the rows of a wrapped line, like CSS `padding-left`
@@ -306,32 +248,29 @@ impl LineIndent {
     }
 }
 
-/// A boundary at which a line was wrapped
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct WrapBoundary {
-    /// The index in the run just before the line was wrapped
-    pub run_ix: usize,
-    /// The index of the glyph just before the line was wrapped
-    pub glyph_ix: usize,
-}
-
 impl WrappedLineLayout {
     /// The length of the underlying text, in utf8 bytes.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
-        self.unwrapped_layout.len
+        self.rows.last().map_or(0, |row| row.range.end)
     }
 
     /// The width of this line, in pixels, whether or not it was wrapped.
     pub fn width(&self) -> Pixels {
-        let indent = if self.wrap_boundaries.is_empty() {
-            self.indent.first
-        } else {
-            self.indent.first.max(self.indent.rest)
-        };
-        self.wrap_width
-            .unwrap_or(Pixels::MAX)
-            .min(self.unwrapped_layout.width + indent)
+        let width = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(ix, row)| row.layout.width + self.indent.for_row(ix))
+            .max()
+            .unwrap_or_default();
+        // A wrapped element occupies its offered width; the final rows were
+        // measured against it and must not be rewrapped into their shorter ink.
+        match self.wrap_width {
+            Some(limit) if self.rows.len() > 1 => limit.max(px(0.)),
+            Some(limit) => width.min(limit.max(px(0.))),
+            None => width,
+        }
     }
 
     /// The size of the whole wrapped text, for the given line_height.
@@ -339,33 +278,36 @@ impl WrappedLineLayout {
     pub fn size(&self, line_height: Pixels) -> Size<Pixels> {
         Size {
             width: self.width(),
-            height: line_height * (self.wrap_boundaries.len() + 1),
+            height: line_height * self.rows.len(),
         }
     }
 
     /// The ascent of a line in this layout
     pub fn ascent(&self) -> Pixels {
-        self.unwrapped_layout.ascent
+        self.rows
+            .iter()
+            .map(|row| row.layout.ascent)
+            .max()
+            .unwrap_or_default()
     }
 
     /// The descent of a line in this layout
     pub fn descent(&self) -> Pixels {
-        self.unwrapped_layout.descent
+        self.rows
+            .iter()
+            .map(|row| row.layout.descent)
+            .max()
+            .unwrap_or_default()
     }
 
-    /// The wrap boundaries in this layout
-    pub fn wrap_boundaries(&self) -> &[WrapBoundary] {
-        &self.wrap_boundaries
+    /// Display rows in source order, including an empty row for empty text.
+    pub fn rows(&self) -> &[ShapedRow] {
+        &self.rows
     }
 
     /// The font size of this layout
     pub fn font_size(&self) -> Pixels {
-        self.unwrapped_layout.font_size
-    }
-
-    /// The runs in this layout, sans wrapping
-    pub fn runs(&self) -> &[ShapedRun] {
-        &self.unwrapped_layout.runs
+        self.rows.first().map_or(px(0.), |row| row.layout.font_size)
     }
 
     /// The index corresponding to a given position in this layout for the given line height.
@@ -394,89 +336,36 @@ impl WrappedLineLayout {
 
     fn _index_for_position(
         &self,
-        mut position: Point<Pixels>,
+        position: Point<Pixels>,
         line_height: Pixels,
         closest: bool,
     ) -> Result<usize, usize> {
         let wrapped_line_ix = (position.y / line_height) as usize;
 
-        let wrapped_line_start_index;
-        let wrapped_line_start_x;
-        if wrapped_line_ix > 0 {
-            let Some(line_start_boundary) = self.wrap_boundaries.get(wrapped_line_ix - 1) else {
-                return Err(0);
-            };
-            let run = &self.unwrapped_layout.runs[line_start_boundary.run_ix];
-            let glyph = &run.glyphs[line_start_boundary.glyph_ix];
-            wrapped_line_start_index = glyph.index;
-            wrapped_line_start_x = glyph.position.x;
-        } else {
-            wrapped_line_start_index = 0;
-            wrapped_line_start_x = Pixels::ZERO;
+        let Some(row) = self.rows.get(wrapped_line_ix) else {
+            return Err(self.len());
         };
-
-        let wrapped_line_end_index;
-        let wrapped_line_end_x;
-        if wrapped_line_ix < self.wrap_boundaries.len() {
-            let next_wrap_boundary_ix = wrapped_line_ix;
-            let next_wrap_boundary = self.wrap_boundaries[next_wrap_boundary_ix];
-            let run = &self.unwrapped_layout.runs[next_wrap_boundary.run_ix];
-            let glyph = &run.glyphs[next_wrap_boundary.glyph_ix];
-            wrapped_line_end_index = glyph.index;
-            wrapped_line_end_x = glyph.position.x;
+        let x = position.x - self.indent.for_row(wrapped_line_ix);
+        if x < px(0.) {
+            Err(row.range.start)
+        } else if x >= row.layout.width {
+            Err(row.range.end)
         } else {
-            wrapped_line_end_index = self.unwrapped_layout.len;
-            wrapped_line_end_x = self.unwrapped_layout.width;
-        };
-
-        let mut position_in_unwrapped_line = position;
-        position_in_unwrapped_line.x += wrapped_line_start_x - self.indent.for_row(wrapped_line_ix);
-        if position_in_unwrapped_line.x < wrapped_line_start_x {
-            Err(wrapped_line_start_index)
-        } else if position_in_unwrapped_line.x >= wrapped_line_end_x {
-            Err(wrapped_line_end_index)
-        } else {
-            if closest {
-                Ok(self
-                    .unwrapped_layout
-                    .closest_index_for_x(position_in_unwrapped_line.x))
+            let index = if closest {
+                row.layout.closest_index_for_x(x)
             } else {
-                Ok(self
-                    .unwrapped_layout
-                    .index_for_x(position_in_unwrapped_line.x)
-                    .unwrap())
-            }
+                row.layout.index_for_x(x).unwrap_or(row.layout.len)
+            };
+            Ok(row.range.start + index)
         }
     }
 
     /// Returns the pixel position for the given byte index.
     pub fn position_for_index(&self, index: usize, line_height: Pixels) -> Option<Point<Pixels>> {
-        let mut line_start_ix = 0;
-        let mut line_end_indices = self
-            .wrap_boundaries
-            .iter()
-            .map(|wrap_boundary| {
-                let run = &self.unwrapped_layout.runs[wrap_boundary.run_ix];
-                let glyph = &run.glyphs[wrap_boundary.glyph_ix];
-                glyph.index
-            })
-            .chain([self.len()])
-            .enumerate();
-        for (ix, line_end_ix) in line_end_indices {
-            let line_y = ix as f32 * line_height;
-            if index < line_start_ix {
-                break;
-            } else if index > line_end_ix {
-                line_start_ix = line_end_ix;
-                continue;
-            } else {
-                let line_start_x = self.unwrapped_layout.x_for_index(line_start_ix);
-                let x = self.unwrapped_layout.x_for_index(index) - line_start_x;
-                return Some(point(x + self.indent.for_row(ix), line_y));
-            }
-        }
-
-        None
+        let ix = self.rows.partition_point(|row| row.range.end < index);
+        let row = self.rows.get(ix)?;
+        let x = row.layout.x_for_index(index - row.range.start);
+        Some(point(x + self.indent.for_row(ix), ix as f32 * line_height))
     }
 }
 
@@ -552,6 +441,7 @@ impl MeasurementCache {
             wrap_width: None,
             force_width: None,
             indent: LineIndent::default(),
+            max_lines: None,
         } as &dyn AsCacheKeyRef)
     }
 
@@ -577,6 +467,7 @@ impl MeasurementCache {
             wrap_width: None,
             force_width: None,
             indent: LineIndent::default(),
+            max_lines: None,
         });
         self.insert(key, layout, bytes);
     }
@@ -722,6 +613,7 @@ impl LineLayoutCache {
             wrap_width,
             force_width: None,
             indent,
+            max_lines,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -741,19 +633,41 @@ impl LineLayoutCache {
             drop(current_frame);
             let text = SharedString::from(text);
             let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
-            let wrap_boundaries = if let Some(wrap_width) = wrap_width {
-                unwrapped_layout.compute_wrap_boundaries(
-                    text.as_ref(),
-                    wrap_width,
-                    max_lines,
-                    indent,
-                )
-            } else {
-                SmallVec::new()
-            };
-            let layout = Arc::new(WrappedLineLayout {
+            let mut run_ends = Vec::with_capacity(runs.len());
+            let mut offset = 0;
+            for run in runs {
+                offset += run.len;
+                run_ends.push(offset);
+            }
+            let rows = wrap::shape(
+                &text,
                 unwrapped_layout,
-                wrap_boundaries,
+                wrap_width,
+                max_lines,
+                indent,
+                |range| {
+                    let mut row_runs = SmallVec::<[FontRun; 1]>::new();
+                    let mut start = range.start;
+                    for (ix, run) in runs
+                        .iter()
+                        .enumerate()
+                        .skip(run_ends.partition_point(|end| *end <= start))
+                    {
+                        let end = run_ends[ix].min(range.end);
+                        row_runs.push(FontRun {
+                            len: end - start,
+                            font_id: run.font_id,
+                        });
+                        start = end;
+                        if start == range.end {
+                            break;
+                        }
+                    }
+                    self.layout_line::<&str>(&text[range], font_size, &row_runs, None)
+                },
+            );
+            let layout = Arc::new(WrappedLineLayout {
+                rows,
                 wrap_width,
                 indent,
             });
@@ -764,6 +678,7 @@ impl LineLayoutCache {
                 wrap_width,
                 force_width: None,
                 indent,
+                max_lines,
             });
 
             let mut current_frame = self.current_frame.write();
@@ -794,6 +709,7 @@ impl LineLayoutCache {
             wrap_width: None,
             force_width,
             indent: LineIndent::default(),
+            max_lines: None,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -822,6 +738,7 @@ impl LineLayoutCache {
                 wrap_width: None,
                 force_width,
                 indent: LineIndent::default(),
+                max_lines: None,
             });
             let layout = Arc::new(layout);
             current_frame.lines.insert(key.clone(), layout.clone());
@@ -1031,6 +948,7 @@ pub(super) struct CacheKey {
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
     indent: LineIndent,
+    max_lines: Option<usize>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -1041,6 +959,7 @@ struct CacheKeyRef<'a> {
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
     indent: LineIndent,
+    max_lines: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -1134,6 +1053,7 @@ impl AsCacheKeyRef for CacheKey {
             wrap_width: self.wrap_width,
             force_width: self.force_width,
             indent: self.indent,
+            max_lines: self.max_lines,
         }
     }
 }
@@ -1234,10 +1154,28 @@ mod tests {
             len: text.len(),
             ..make_layout(glyphs)
         });
-        let wrap_boundaries = unwrapped_layout.compute_wrap_boundaries(text, px(45.), None, indent);
-        WrappedLineLayout {
+        let rows = wrap::shape(
+            text,
             unwrapped_layout,
-            wrap_boundaries,
+            Some(px(45.)),
+            None,
+            indent,
+            |range| {
+                let text = &text[range];
+                Arc::new(LineLayout {
+                    width: px(text.chars().count() as f32 * 10.),
+                    len: text.len(),
+                    ..make_layout(
+                        text.char_indices()
+                            .enumerate()
+                            .map(|(ix, (index, _))| glyph_at(ix as f32 * 10., index))
+                            .collect(),
+                    )
+                })
+            },
+        );
+        WrappedLineLayout {
+            rows,
             wrap_width: Some(px(45.)),
             indent,
         }
@@ -1247,9 +1185,10 @@ mod tests {
     fn test_hanging_indent_wraps_and_maps_indented_rows() {
         let row_starts = |layout: &WrappedLineLayout| {
             layout
-                .wrap_boundaries
+                .rows
                 .iter()
-                .map(|boundary| layout.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index)
+                .skip(1)
+                .map(|row| row.range.start)
                 .collect::<Vec<_>>()
         };
         // Unindented rows fit four ideographs after the first row.

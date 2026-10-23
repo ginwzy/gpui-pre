@@ -695,11 +695,36 @@ impl WindowTextSystem {
                 line_indent,
             );
             line_indent = LineIndent::uniform(indent.rest);
-            wrapped_lines += layout.wrap_boundaries.len();
+            wrapped_lines += layout.rows().len().saturating_sub(1);
+
+            let mut decorations = decoration_runs.into_iter();
+            let mut current = decorations.next();
+            let row_decorations = layout
+                .rows()
+                .iter()
+                .map(|row| {
+                    let mut remaining = row.range().len();
+                    let mut runs = SmallVec::new();
+                    while remaining > 0 {
+                        let Some(run) = current.as_mut() else { break };
+                        let len = remaining.min(run.len as usize);
+                        runs.push(DecorationRun {
+                            len: len as u32,
+                            ..run.clone()
+                        });
+                        remaining -= len;
+                        run.len -= len as u32;
+                        if run.len == 0 {
+                            current = decorations.next();
+                        }
+                    }
+                    runs
+                })
+                .collect();
 
             lines.push(WrappedLine {
                 layout,
-                decoration_runs,
+                decoration_runs: row_decorations,
                 text: line_text,
             });
 

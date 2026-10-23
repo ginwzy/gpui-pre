@@ -820,7 +820,7 @@ mod tests {
     use super::*;
     use crate::{Font, FontFeatures, FontStyle, FontWeight, TestAppContext, TestDispatcher, font};
     #[cfg(target_os = "macos")]
-    use crate::{TextRun, WindowTextSystem, WrapBoundary};
+    use crate::{TextRun, WindowTextSystem};
 
     fn build_wrapper() -> LineWrapper {
         let dispatcher = TestDispatcher::new(0);
@@ -1502,21 +1502,13 @@ mod tests {
                 .unwrap();
 
             assert_eq!(
-                lines[0].layout.wrap_boundaries(),
-                &[
-                    WrapBoundary {
-                        run_ix: 0,
-                        glyph_ix: 7
-                    },
-                    WrapBoundary {
-                        run_ix: 0,
-                        glyph_ix: 12
-                    },
-                    WrapBoundary {
-                        run_ix: 0,
-                        glyph_ix: 18
-                    }
-                ],
+                lines[0]
+                    .rows()
+                    .iter()
+                    .skip(1)
+                    .map(|row| row.range().start)
+                    .collect::<Vec<_>>(),
+                [7, 12, 18],
             );
         });
     }
