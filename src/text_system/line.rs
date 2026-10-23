@@ -92,6 +92,8 @@ impl ShapedLine {
         paint_line(
             origin,
             &self.layout,
+            self.layout.ascent,
+            self.layout.descent,
             line_height,
             align,
             align_width,
@@ -221,6 +223,8 @@ impl LineLayout {
         paint_line(
             origin,
             self,
+            self.ascent,
+            self.descent,
             line_height,
             align,
             align_width,
@@ -291,6 +295,7 @@ impl WrappedLine {
             None => self.layout.wrap_width,
         };
 
+        let (ascent, descent) = (self.layout.ascent(), self.layout.descent());
         for (ix, (row, decorations)) in self
             .layout
             .rows()
@@ -302,6 +307,8 @@ impl WrappedLine {
             paint_line(
                 origin + point(inset, ix as f32 * line_height),
                 row.layout(),
+                ascent,
+                descent,
                 line_height,
                 align,
                 align_width.map(|width| width - inset),
@@ -353,9 +360,13 @@ impl WrappedLine {
     }
 }
 
+/// `ascent` and `descent` place the baseline. The rows of a wrapped line pass
+/// the line's own metrics so they share one baseline whatever fonts each holds.
 fn paint_line(
     origin: Point<Pixels>,
     layout: &LineLayout,
+    ascent: Pixels,
+    descent: Pixels,
     line_height: Pixels,
     align: TextAlign,
     align_width: Option<Pixels>,
@@ -374,8 +385,8 @@ fn paint_line(
     );
     let line_bounds = Bounds::new(origin, size(layout.width, line_height));
     window.paint_layer(line_bounds, |window| {
-        let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
-        let baseline_offset = point(px(0.), padding_top + layout.ascent);
+        let padding_top = (line_height - ascent - descent) / 2.;
+        let baseline_offset = point(px(0.), padding_top + ascent);
         let mut decoration_runs = decoration_runs.iter();
         let mut run_end = 0;
         let mut color = black();
@@ -413,7 +424,7 @@ fn paint_line(
                             current_underline.get_or_insert((
                                 point(
                                     glyph_origin.x,
-                                    glyph_origin.y + baseline_offset.y + (layout.descent * 0.618),
+                                    glyph_origin.y + baseline_offset.y + (descent * 0.618),
                                 ),
                                 UnderlineStyle {
                                     color: Some(run_underline.color.unwrap_or(style_run.color)),
@@ -431,8 +442,7 @@ fn paint_line(
                             current_strikethrough.get_or_insert((
                                 point(
                                     glyph_origin.x,
-                                    glyph_origin.y
-                                        + (((layout.ascent * 0.5) + baseline_offset.y) * 0.5),
+                                    glyph_origin.y + (((ascent * 0.5) + baseline_offset.y) * 0.5),
                                 ),
                                 StrikethroughStyle {
                                     color: Some(run_strikethrough.color.unwrap_or(style_run.color)),
