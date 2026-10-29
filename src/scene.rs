@@ -1,12 +1,13 @@
 // todo("windows"): remove
 #![cfg_attr(windows, allow(dead_code))]
 
+use collections::FxHashMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, GlobalElementId,
+    Hsla, Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
@@ -41,7 +42,7 @@ impl From<bool> for PaddedBool32 {
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
-    layer_stack: Vec<DrawOrder>,
+    layer_stack: Vec<Layer>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -50,6 +51,43 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    /// Isolated surfaces, composited into this scene in paint order.
+    pub composites: Vec<Composite>,
+    composite_ids: FxHashMap<GlobalElementId, usize>,
+    active_clips: Vec<usize>,
+}
+
+struct Layer {
+    bounds: Bounds<ScaledPixels>,
+    order: DrawOrder,
+}
+
+/// One isolated surface. Its descendants are blended before the rounded mask is applied.
+pub struct Composite {
+    order: DrawOrder,
+    bounds: Bounds<ScaledPixels>,
+    radii: Corners<ScaledPixels>,
+    content_mask: ContentMask<ScaledPixels>,
+    scene: Box<Scene>,
+}
+
+impl Composite {
+    /// The original rounded rectangle, before intersection with ancestor masks.
+    pub fn bounds(&self) -> Bounds<ScaledPixels> {
+        self.bounds
+    }
+    /// Per-corner radii in device pixels.
+    pub fn radii(&self) -> Corners<ScaledPixels> {
+        self.radii
+    }
+    /// The visible rectangular extent; the rounded geometry is not rebased to it.
+    pub fn content_mask(&self) -> ContentMask<ScaledPixels> {
+        self.content_mask
+    }
+    /// The contents of this isolated surface, including deferred overlays hosted by it.
+    pub fn scene(&self) -> &Scene {
+        &self.scene
+    }
 }
 
 #[expect(missing_docs)]
@@ -66,21 +104,79 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.composites.clear();
+        self.composite_ids.clear();
+        self.active_clips.clear();
     }
 
     pub fn len(&self) -> usize {
         self.paint_operations.len()
     }
 
+    fn target(&mut self) -> &mut Scene {
+        let Some((&first, rest)) = self.active_clips.split_first() else {
+            return self;
+        };
+        let mut scene = self.composites[first].scene.as_mut();
+        for &ix in rest {
+            scene = scene.composites[ix].scene.as_mut();
+        }
+        scene
+    }
+
+    pub(crate) fn push_clip(
+        &mut self,
+        id: GlobalElementId,
+        bounds: Bounds<ScaledPixels>,
+        radii: Corners<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+    ) {
+        let target = self.target();
+        let ix = if let Some(ix) = target.composite_ids.get(&id) {
+            *ix
+        } else {
+            let visible = bounds.intersect(&content_mask.bounds);
+            // Isolation is a paint-order boundary, including inside an explicit layer.
+            let order = target.primitive_bounds.insert(visible);
+            let ix = target.composites.len();
+            target.composites.push(Composite {
+                order,
+                bounds,
+                radii,
+                content_mask,
+                scene: Box::default(),
+            });
+            target.composite_ids.insert(id.clone(), ix);
+            ix
+        };
+        self.active_clips.push(ix);
+        self.paint_operations.push(PaintOperation::StartClip {
+            id,
+            bounds,
+            radii,
+            content_mask,
+        });
+    }
+
+    pub(crate) fn pop_clip(&mut self) {
+        self.active_clips.pop().expect("balanced clipping scopes");
+        let target = self.target();
+        for layer in &mut target.layer_stack {
+            layer.order = target.primitive_bounds.insert(layer.bounds);
+        }
+        self.paint_operations.push(PaintOperation::EndClip);
+    }
+
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
-        let order = self.primitive_bounds.insert(bounds);
-        self.layer_stack.push(order);
+        let target = self.target();
+        let order = target.primitive_bounds.insert(bounds);
+        target.layer_stack.push(Layer { bounds, order });
         self.paint_operations
             .push(PaintOperation::StartLayer(bounds));
     }
 
     pub fn pop_layer(&mut self) {
-        self.layer_stack.pop();
+        self.target().layer_stack.pop();
         self.paint_operations.push(PaintOperation::EndLayer);
     }
 
@@ -94,44 +190,45 @@ impl Scene {
             return;
         }
 
-        let order = self
+        let target = self.target();
+        let order = target
             .layer_stack
             .last()
-            .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+            .map(|layer| layer.order)
+            .unwrap_or_else(|| target.primitive_bounds.insert(clipped_bounds));
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
-                self.shadows.push(*shadow);
+                target.shadows.push(*shadow);
             }
             Primitive::Quad(quad) => {
                 quad.order = order;
-                self.quads.push(*quad);
+                target.quads.push(*quad);
             }
             Primitive::Path(path) => {
                 path.order = order;
-                path.id = PathId(self.paths.len());
-                self.paths.push(path.clone());
+                path.id = PathId(target.paths.len());
+                target.paths.push(path.clone());
             }
             Primitive::Underline(underline) => {
                 underline.order = order;
-                self.underlines.push(*underline);
+                target.underlines.push(*underline);
             }
             Primitive::MonochromeSprite(sprite) => {
                 sprite.order = order;
-                self.monochrome_sprites.push(*sprite);
+                target.monochrome_sprites.push(*sprite);
             }
             Primitive::SubpixelSprite(sprite) => {
                 sprite.order = order;
-                self.subpixel_sprites.push(*sprite);
+                target.subpixel_sprites.push(*sprite);
             }
             Primitive::PolychromeSprite(sprite) => {
                 sprite.order = order;
-                self.polychrome_sprites.push(*sprite);
+                target.polychrome_sprites.push(*sprite);
             }
             Primitive::Surface(surface) => {
                 surface.order = order;
-                self.surfaces.push(surface.clone());
+                target.surfaces.push(surface.clone());
             }
         }
         self.paint_operations
@@ -144,11 +241,25 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::StartClip {
+                    id,
+                    bounds,
+                    radii,
+                    content_mask,
+                } => self.push_clip(id.clone(), *bounds, *radii, *content_mask),
+                PaintOperation::EndClip => self.pop_clip(),
             }
         }
     }
 
     pub fn finish(&mut self) {
+        debug_assert!(self.active_clips.is_empty());
+        for composite in &mut self.composites {
+            composite.scene.finish();
+        }
+        self.composites.sort_by_key(|composite| composite.order);
+        // IDs are only used while recording. Sorting changes their indices.
+        self.composite_ids.clear();
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
         self.paths.sort_by_key(|path| path.order);
@@ -171,6 +282,8 @@ impl Scene {
     )]
     pub fn batches(&self) -> impl Iterator<Item = PrimitiveBatch> + '_ {
         BatchIterator {
+            composites_start: 0,
+            composites_iter: self.composites.iter().peekable(),
             shadows_start: 0,
             shadows_iter: self.shadows.iter().peekable(),
             quads_start: 0,
@@ -200,6 +313,7 @@ impl Scene {
     allow(dead_code)
 )]
 pub(crate) enum PrimitiveKind {
+    Composite,
     Shadow,
     #[default]
     Quad,
@@ -215,6 +329,13 @@ pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+    StartClip {
+        id: GlobalElementId,
+        bounds: Bounds<ScaledPixels>,
+        radii: Corners<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+    },
+    EndClip,
 }
 
 #[derive(Clone)]
@@ -267,6 +388,8 @@ impl Primitive {
     allow(dead_code)
 )]
 struct BatchIterator<'a> {
+    composites_start: usize,
+    composites_iter: Peekable<slice::Iter<'a, Composite>>,
     shadows_start: usize,
     shadows_iter: Peekable<slice::Iter<'a, Shadow>>,
     quads_start: usize,
@@ -290,6 +413,10 @@ impl<'a> Iterator for BatchIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut orders_and_kinds = [
+            (
+                self.composites_iter.peek().map(|c| c.order),
+                PrimitiveKind::Composite,
+            ),
             (
                 self.shadows_iter.peek().map(|s| s.order),
                 PrimitiveKind::Shadow,
@@ -328,6 +455,12 @@ impl<'a> Iterator for BatchIterator<'a> {
         };
 
         match batch_kind {
+            PrimitiveKind::Composite => {
+                let start = self.composites_start;
+                self.composites_iter.next();
+                self.composites_start += 1;
+                Some(PrimitiveBatch::Composites(start..start + 1))
+            }
             PrimitiveKind::Shadow => {
                 let shadows_start = self.shadows_start;
                 let mut shadows_end = shadows_start + 1;
@@ -475,6 +608,7 @@ impl<'a> Iterator for BatchIterator<'a> {
 )]
 #[allow(missing_docs)]
 pub enum PrimitiveBatch {
+    Composites(Range<usize>),
     Shadows(Range<usize>),
     Quads(Range<usize>),
     Paths(Range<usize>),
@@ -499,6 +633,7 @@ impl PrimitiveBatch {
     #[expect(missing_docs)]
     pub fn label(&self) -> String {
         match self {
+            Self::Composites(range) => format!("composites ({})", range.len()),
             Self::Shadows(range) => format!("shadows ({})", range.len()),
             Self::Quads(range) => format!("quads ({})", range.len()),
             Self::Paths(range) => format!("paths ({})", range.len()),

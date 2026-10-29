@@ -292,6 +292,8 @@ struct ViewElementState {
 struct ViewElementCacheKey {
     bounds: Bounds<Pixels>,
     content_mask: ContentMask<Pixels>,
+    rounded_clip: Option<std::sync::Arc<crate::ClipContext>>,
+    overlay_clip: Option<std::sync::Arc<crate::ClipContext>>,
     text_style: TextStyle,
 }
 
@@ -382,10 +384,14 @@ impl<V: View> Element for ViewElement<V> {
                     |element_state, window| {
                         let content_mask = window.content_mask();
                         let text_style = window.text_style();
+                        let rounded_clip = window.rounded_clip.clone();
+                        let overlay_clip = window.overlay_clip.clone();
 
                         if let Some(mut element_state) = element_state
                             && element_state.cache_key.bounds == bounds
                             && element_state.cache_key.content_mask == content_mask
+                            && element_state.cache_key.rounded_clip == rounded_clip
+                            && element_state.cache_key.overlay_clip == overlay_clip
                             && element_state.cache_key.text_style == text_style
                             && !window.dirty_views.contains(&entity_id)
                             && !window.refreshing
@@ -426,6 +432,8 @@ impl<V: View> Element for ViewElement<V> {
                                 cache_key: ViewElementCacheKey {
                                     bounds,
                                     content_mask,
+                                    rounded_clip,
+                                    overlay_clip,
                                     text_style,
                                 },
                             },
