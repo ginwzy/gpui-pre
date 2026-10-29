@@ -1,6 +1,10 @@
 // todo("windows"): remove
 #![cfg_attr(windows, allow(dead_code))]
 
+mod clip;
+
+pub use clip::ClipTiles;
+
 use collections::FxHashMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -51,7 +55,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
-    /// Isolated surfaces, composited into this scene in paint order.
+    /// Clipped subtrees, drawn into this scene in paint order.
     pub composites: Vec<Composite>,
     composite_ids: FxHashMap<GlobalElementId, usize>,
     active_clips: Vec<usize>,
@@ -62,7 +66,7 @@ struct Layer {
     order: DrawOrder,
 }
 
-/// One isolated surface. Its descendants are blended before the rounded mask is applied.
+/// A clipped subtree. Fractional edge coverage is applied after its descendants blend.
 pub struct Composite {
     order: DrawOrder,
     bounds: Bounds<ScaledPixels>,
@@ -84,7 +88,12 @@ impl Composite {
     pub fn content_mask(&self) -> ContentMask<ScaledPixels> {
         self.content_mask
     }
-    /// The contents of this isolated surface, including deferred overlays hosted by it.
+    /// Partitions visible device pixels into direct and isolated drawing regions.
+    /// The viewport and returned rectangles are aligned to device pixels.
+    pub fn tiles(&self, viewport: Bounds<ScaledPixels>) -> ClipTiles {
+        ClipTiles::new(self.bounds, self.radii, self.content_mask.bounds, viewport)
+    }
+    /// The contents of this clipped subtree, including deferred overlays hosted by it.
     pub fn scene(&self) -> &Scene {
         &self.scene
     }
@@ -107,6 +116,11 @@ impl Scene {
         self.composites.clear();
         self.composite_ids.clear();
         self.active_clips.clear();
+    }
+
+    /// Whether this scene or a clipped descendant needs path rasterization storage.
+    pub fn has_paths(&self) -> bool {
+        !self.paths.is_empty() || self.composites.iter().any(|c| c.scene.has_paths())
     }
 
     pub fn len(&self) -> usize {
@@ -271,6 +285,87 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+    }
+
+    /// A conservative contiguous instance range intersecting a drawing region.
+    /// Only strips invisible prefixes/suffixes; keeps paint order and any gaps.
+    /// Transformed glyphs stay in the range because their stored bounds are local.
+    pub fn visible_range(
+        &self,
+        batch: &PrimitiveBatch,
+        bounds: Bounds<ScaledPixels>,
+    ) -> Range<usize> {
+        fn trim<T>(
+            values: &[T],
+            range: &Range<usize>,
+            mut visible: impl FnMut(&T) -> bool,
+        ) -> Range<usize> {
+            let mut first = range.start;
+            let mut end = range.end;
+            while first < end && !visible(&values[first]) {
+                first += 1;
+            }
+            while first < end && !visible(&values[end - 1]) {
+                end -= 1;
+            }
+            first..end
+        }
+        let left = bounds.origin.x.0;
+        let top = bounds.origin.y.0;
+        let right = left + bounds.size.width.0;
+        let bottom = top + bounds.size.height.0;
+        let overlaps = |r: Bounds<ScaledPixels>| {
+            r.origin.x.0 < right
+                && r.origin.x.0 + r.size.width.0 > left
+                && r.origin.y.0 < bottom
+                && r.origin.y.0 + r.size.height.0 > top
+        };
+        // These independent tests may retain extra instances, but cannot discard
+        // a visible one. Avoid constructing intersection rectangles in this scan.
+        let intersects = |primitive: Bounds<ScaledPixels>, mask: ContentMask<ScaledPixels>| {
+            overlaps(primitive) && overlaps(mask.bounds)
+        };
+        match batch {
+            PrimitiveBatch::Quads(range) => {
+                trim(&self.quads, range, |p| intersects(p.bounds, p.content_mask))
+            }
+            // Shaders draw inset shadows over the element and drop shadows with a
+            // gaussian tail of three blur radii, both beyond `bounds`.
+            PrimitiveBatch::Shadows(range) => trim(&self.shadows, range, |p| {
+                let geometry = if p.inset != 0 {
+                    p.element_bounds
+                } else {
+                    p.bounds.dilate(p.blur_radius * 3.)
+                };
+                intersects(geometry, p.content_mask)
+            }),
+            PrimitiveBatch::Underlines(range) => trim(&self.underlines, range, |p| {
+                intersects(p.bounds, p.content_mask)
+            }),
+            PrimitiveBatch::MonochromeSprites { range, .. } => {
+                trim(&self.monochrome_sprites, range, |p| {
+                    p.transformation != TransformationMatrix::unit()
+                        || intersects(p.bounds, p.content_mask)
+                })
+            }
+            PrimitiveBatch::SubpixelSprites { range, .. } => {
+                trim(&self.subpixel_sprites, range, |p| {
+                    p.transformation != TransformationMatrix::unit()
+                        || intersects(p.bounds, p.content_mask)
+                })
+            }
+            PrimitiveBatch::PolychromeSprites { range, .. } => {
+                trim(&self.polychrome_sprites, range, |p| {
+                    intersects(p.bounds, p.content_mask)
+                })
+            }
+            PrimitiveBatch::Surfaces(range) => trim(&self.surfaces, range, |p| {
+                intersects(p.bounds, p.content_mask)
+            }),
+            // Paths have a separate rasterization/copy pass; composites recurse with
+            // their own regions. Neither is an ordinary instance draw range.
+            PrimitiveBatch::Paths(range) | PrimitiveBatch::Composites(range) => range.clone(),
+        }
     }
 
     #[cfg_attr(

@@ -218,3 +218,23 @@ pub fn observe<T: 'static>(entity: &Entity<T>, cx: &mut TestAppContext) -> Obser
 
     Observation { rx, _subscription }
 }
+
+/// Records a rounded subtree for renderer tests without creating a platform window.
+/// Uses the same scene boundaries as `Window::with_rounded_clip`.
+pub fn with_scene_clip(
+    scene: &mut crate::Scene,
+    id: &'static str,
+    bounds: crate::Bounds<crate::ScaledPixels>,
+    radii: crate::Corners<crate::ScaledPixels>,
+    mask: crate::ContentMask<crate::ScaledPixels>,
+    paint: impl FnOnce(&mut crate::Scene),
+) {
+    scene.push_clip(
+        crate::GlobalElementId(vec![id.into()].into()),
+        bounds,
+        radii,
+        mask,
+    );
+    paint(scene);
+    scene.pop_clip();
+}

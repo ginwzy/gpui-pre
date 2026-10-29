@@ -246,3 +246,168 @@ fn isolation_splits_an_explicit_paint_layer() {
         labels
     );
 }
+
+#[test]
+fn clip_tiles_cover_each_pixel_once_and_only_isolate_edges() {
+    use crate::{ContentMask, ScaledPixels};
+    let rect = |x, y, w, h| {
+        Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            size(ScaledPixels(w), ScaledPixels(h)),
+        )
+    };
+    for scale in [1., 1.25, 1.5, 2.] {
+        for (width, height) in [(100., 80.), (3., 3.), (1., 1.)] {
+            for offset in [0., 0.2, 0.5, 0.9] {
+                for corners in [[16., 16., 16., 16.], [0., 10., 5., 20.], [0.; 4]] {
+                    let bounds = rect(
+                        10. * scale + offset,
+                        20. * scale + offset,
+                        width * scale,
+                        height * scale,
+                    );
+                    let radii = Corners {
+                        top_left: ScaledPixels(corners[0] * scale),
+                        top_right: ScaledPixels(corners[1] * scale),
+                        bottom_left: ScaledPixels(corners[2] * scale),
+                        bottom_right: ScaledPixels(corners[3] * scale),
+                    }
+                    .clamp_radii_for_quad_size(bounds.size);
+                    for mask in [rect(0., 0., 256., 256.), rect(20., 25., 100., 90.)] {
+                        let mut scene = Scene::default();
+                        scene.push_clip(
+                            GlobalElementId::default(),
+                            bounds,
+                            radii,
+                            ContentMask { bounds: mask },
+                        );
+                        scene.pop_clip();
+                        let viewport = rect(0., 0., 200., 170.);
+                        let tiles = scene.composites[0].tiles(viewport);
+                        let visible = bounds.intersect(&mask).intersect(&viewport);
+                        if visible.is_empty() {
+                            assert!(tiles.direct().is_empty() && tiles.isolated().is_empty());
+                            continue;
+                        }
+                        let contains = |r: &Bounds<ScaledPixels>, x: f32, y: f32| {
+                            x >= r.left().0 && x < r.right().0 && y >= r.top().0 && y < r.bottom().0
+                        };
+                        let regions: Vec<_> =
+                            tiles.direct().iter().chain(tiles.isolated()).collect();
+                        for r in &regions {
+                            assert!(!r.is_empty());
+                            assert_eq!(r.origin.x.0.fract(), 0.);
+                            assert_eq!(r.origin.y.0.fract(), 0.);
+                            assert_eq!(r.size.width.0.fract(), 0.);
+                            assert_eq!(r.size.height.0.fract(), 0.);
+                        }
+                        for y in
+                            visible.top().0.floor() as i32 - 1..=visible.bottom().0.ceil() as i32
+                        {
+                            for x in visible.left().0.floor() as i32 - 1
+                                ..=visible.right().0.ceil() as i32
+                            {
+                                let (x, y) = (x as f32 + 0.5, y as f32 + 0.5);
+                                let inside = x >= visible.left().0.floor()
+                                    && x < visible.right().0.ceil()
+                                    && y >= visible.top().0.floor()
+                                    && y < visible.bottom().0.ceil();
+                                assert_eq!(
+                                    regions.iter().filter(|r| contains(r, x, y)).count(),
+                                    usize::from(inside),
+                                    "overlap or gap at {x},{y}"
+                                );
+                                if tiles.direct().iter().any(|r| contains(r, x, y)) {
+                                    // Evaluate the shader's rounded-rectangle distance at the pixel center.
+                                    let dx = x - (bounds.left().0 + bounds.size.width.0 / 2.);
+                                    let dy = y - (bounds.top().0 + bounds.size.height.0 / 2.);
+                                    let radius = match (dx < 0., dy < 0.) {
+                                        (true, true) => radii.top_left.0,
+                                        (false, true) => radii.top_right.0,
+                                        (true, false) => radii.bottom_left.0,
+                                        (false, false) => radii.bottom_right.0,
+                                    };
+                                    let qx = dx.abs() - bounds.size.width.0 / 2. + radius;
+                                    let qy = dy.abs() - bounds.size.height.0 / 2. + radius;
+                                    let distance =
+                                        qx.max(0.).hypot(qy.max(0.)) + qx.max(qy).min(0.) - radius;
+                                    assert!(
+                                        distance <= -0.5 + 0.0001,
+                                        "partial coverage leaked into direct tile: {distance}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn clip_tiles_keep_4k_isolation_bounded_by_corner_size() {
+    use crate::{ContentMask, ScaledPixels};
+    let bounds = Bounds::new(
+        point(ScaledPixels(0.), ScaledPixels(0.)),
+        size(ScaledPixels(3840.), ScaledPixels(2160.)),
+    );
+    let mut scene = Scene::default();
+    scene.push_clip(
+        GlobalElementId::default(),
+        bounds,
+        Corners::all(ScaledPixels(16.)),
+        ContentMask { bounds },
+    );
+    scene.pop_clip();
+    let tiles = scene.composites[0].tiles(bounds);
+    assert_eq!(tiles.isolated().len(), 4);
+    assert_eq!(tiles.direct().len(), 3);
+    let area: f32 = tiles
+        .isolated()
+        .iter()
+        .map(|r| r.size.width.0 * r.size.height.0)
+        .sum();
+    assert_eq!(area, 4. * 16. * 16.);
+}
+
+#[test]
+fn visible_range_keeps_shadows_drawn_beyond_their_bounds() {
+    use crate::{ContentMask, Hsla, PrimitiveBatch, ScaledPixels, Shadow};
+    let rect = |x, y, w, h| {
+        Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            size(ScaledPixels(w), ScaledPixels(h)),
+        )
+    };
+    let mask = ContentMask {
+        bounds: rect(0., 0., 400., 400.),
+    };
+    let shadow = |bounds, element_bounds, blur_radius, inset| Shadow {
+        order: 0,
+        blur_radius: ScaledPixels(blur_radius),
+        bounds,
+        corner_radii: Corners::default(),
+        content_mask: mask,
+        color: Hsla::default(),
+        element_bounds,
+        element_corner_radii: Corners::default(),
+        inset,
+        pad: 0,
+    };
+    // A region (such as the band between two corners) next to each shadow's bounds.
+    let region = rect(0., 0., 400., 16.);
+    for (shadow, visible) in [
+        // The gaussian tail reaches 3 * 4px above the drop shadow's bounds.
+        (shadow(rect(50., 20., 100., 100.), rect(50., 20., 100., 100.), 4., 0), true),
+        (shadow(rect(50., 40., 100., 100.), rect(50., 40., 100., 100.), 4., 0), false),
+        // An inset shadow is drawn over its element, though its hole is offset away.
+        (shadow(rect(50., 30., 100., 100.), rect(50., 10., 100., 100.), 0., 1), true),
+    ] {
+        let mut scene = Scene::default();
+        scene.insert_primitive(shadow);
+        scene.finish();
+        let batch = PrimitiveBatch::Shadows(0..1);
+        assert_eq!(!scene.visible_range(&batch, region).is_empty(), visible);
+    }
+}
