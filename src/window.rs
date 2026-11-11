@@ -834,6 +834,19 @@ pub struct Hitbox {
 }
 
 impl Hitbox {
+    /// A detached rectangular hitbox for tests that register participants
+    /// without rendering a window. Real elements use `Window::insert_hitbox`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(bounds: Bounds<Pixels>) -> Self {
+        Self {
+            id: HitboxId::placeholder(),
+            bounds,
+            content_mask: ContentMask { bounds },
+            rounded_clip: None,
+            behavior: HitboxBehavior::Normal,
+        }
+    }
+
     /// Checks if the hitbox is currently hovered. Returns `false` during keyboard input modality
     /// so that keyboard navigation suppresses hover highlights. Except when handling
     /// `ScrollWheelEvent`, this is typically what you want when determining whether to handle mouse
