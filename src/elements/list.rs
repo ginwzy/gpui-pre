@@ -10,8 +10,8 @@
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
-    Window, point, px, size,
+    Overflow, Pixels, Point, ScrollWheelEvent, Size, Style, StyleRefinement, Styled, Window, point,
+    px, size,
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
@@ -245,7 +245,14 @@ pub enum ListAlignment {
 }
 
 /// A scroll event that has been converted to be in terms of the list's items.
+#[non_exhaustive]
 pub struct ListScrollEvent {
+    /// The original input packet whose movement this event reports.
+    pub input: ScrollWheelEvent,
+
+    /// The actual change in content scroll top; positive moves toward later items.
+    pub scroll_delta: Pixels,
+
     /// The range of items currently visible in the list, after applying the scroll event.
     pub visible_range: Range<usize>,
 
@@ -1217,9 +1224,10 @@ impl StateInner {
 
     fn scroll(
         &mut self,
-        scroll_top: &ListOffset,
+        scroll_top: &mut ListOffset,
         height: Pixels,
         delta: Point<Pixels>,
+        input: &ScrollWheelEvent,
         current_view: EntityId,
         window: &mut Window,
         cx: &mut App,
@@ -1230,6 +1238,7 @@ impl StateInner {
             return;
         }
 
+        let previous_top = self.scroll_top(scroll_top);
         let padding = self.last_padding.unwrap_or_default();
         let scroll_max =
             (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
@@ -1237,22 +1246,22 @@ impl StateInner {
             .max(px(0.))
             .min(scroll_max);
 
+        let (start, ..) =
+            self.items
+                .find::<ListItemSummary, _>((), &Height(new_scroll_top), Bias::Right);
+        let resolved_top = ListOffset {
+            item_ix: start.count,
+            offset_in_item: new_scroll_top - start.height,
+        };
         if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
             self.pending_scroll = None;
             self.logical_scroll_top = None;
         } else {
-            let (start, ..) =
-                self.items
-                    .find::<ListItemSummary, _>((), &Height(new_scroll_top), Bias::Right);
-            let scroll_top = ListOffset {
-                item_ix: start.count,
-                offset_in_item: new_scroll_top - start.height,
-            };
             // The user's scroll supersedes the position stashed by a
             // remeasure; re-anchor the pending adjustment so it doesn't revert
             // this scroll on the next layout.
-            self.rebase_pending_scroll(scroll_top);
-            self.logical_scroll_top = Some(scroll_top);
+            self.rebase_pending_scroll(resolved_top);
+            self.logical_scroll_top = Some(resolved_top);
         }
 
         if delta.y > px(0.) {
@@ -1263,6 +1272,8 @@ impl StateInner {
             let visible_range = Self::visible_range(&self.items, height, scroll_top);
             handler(
                 &ListScrollEvent {
+                    input: input.clone(),
+                    scroll_delta: new_scroll_top - previous_top,
                     visible_range,
                     count: self.items.summary().count,
                     is_scrolled: self.logical_scroll_top.is_some(),
@@ -1276,6 +1287,9 @@ impl StateInner {
             );
         }
 
+        // The next packet in this frame starts at the actual clamped position,
+        // including the physical bottom when logical_scroll_top is the tail sentinel.
+        *scroll_top = resolved_top;
         cx.notify(current_view);
     }
 
@@ -1940,17 +1954,18 @@ impl Element for List {
         // div-based scroll containers.
         let list_state = self.state.clone();
         let height = bounds.size.height;
-        let scroll_top = prepaint.layout.scroll_top;
+        let mut scroll_top = prepaint.layout.scroll_top;
         let hitbox_id = prepaint.hitbox.id;
-        let mut accumulated_scroll_delta = ScrollDelta::default();
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
-                accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
-                let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
+                // Apply each original packet from the preceding resolved position.
+                // Reversals and gesture ends cannot replay consumed motion, and
+                // distance clipped at an edge cannot delay the next reverse input.
                 list_state.0.borrow_mut().scroll(
-                    &scroll_top,
+                    &mut scroll_top,
                     height,
-                    pixel_delta,
+                    event.delta.pixel_delta(px(20.)),
+                    event,
                     current_view,
                     window,
                     cx,
@@ -2090,6 +2105,147 @@ mod test {
         IntoElement, ListOffset, ListState, PreparedListItems, Render, Styled, TestAppContext,
         Window, canvas, div, list, point, px, size,
     };
+
+    struct WheelList(ListState);
+
+    impl Render for WheelList {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            list(self.0.clone(), |_, _, _| {
+                div().h(px(20.)).w_full().into_any()
+            })
+            .w_full()
+            .h_full()
+        }
+    }
+
+    fn assert_wheel_batch(cx: &mut TestAppContext, deltas: &[f32]) {
+        assert_aligned_wheel_batch(cx, crate::ListAlignment::Top, deltas);
+    }
+
+    fn assert_aligned_wheel_batch(
+        cx: &mut TestAppContext,
+        alignment: crate::ListAlignment,
+        deltas: &[f32],
+    ) {
+        let state = ListState::new(30, alignment, px(10.)).measure_all();
+        if alignment == crate::ListAlignment::Top {
+            state.scroll_to(ListOffset {
+                item_ix: 10,
+                offset_in_item: px(0.),
+            });
+        }
+        let window = cx.open_window(size(px(100.), px(100.)), |_, _| WheelList(state.clone()));
+        let mut cx = crate::VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|window, cx| {
+            let mut expected = if alignment == crate::ListAlignment::Top {
+                200.
+            } else {
+                500.
+            };
+            for (ix, &delta) in deltas.iter().enumerate() {
+                window.dispatch_event(
+                    crate::PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position: point(px(20.), px(20.)),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
+                        touch_phase: if delta == 0. {
+                            crate::TouchPhase::Ended
+                        } else {
+                            crate::TouchPhase::Moved
+                        },
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                expected = (expected - delta).clamp(0., 500.);
+                let actual = state.scroll_px_offset_for_scrollbar().y.as_f32().abs();
+                assert!(
+                    (actual - expected).abs() < 0.01,
+                    "packet {ix}, delta {delta}: expected {expected}, actual {actual}"
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn wheel_direction_reversals_keep_each_packets_distance(cx: &mut TestAppContext) {
+        assert_wheel_batch(cx, &[-48., 12., 0.]);
+        assert_wheel_batch(cx, &[48., -12., 0.]);
+    }
+
+    #[gpui::test]
+    fn ending_a_wheel_gesture_does_not_move_the_list(cx: &mut TestAppContext) {
+        assert_wheel_batch(cx, &[-48., 0.]);
+        assert_wheel_batch(cx, &[48., 0.]);
+    }
+
+    #[gpui::test]
+    fn bottom_aligned_batches_keep_the_physical_tail_position(cx: &mut TestAppContext) {
+        assert_aligned_wheel_batch(
+            cx,
+            crate::ListAlignment::Bottom,
+            &[0., 12., -12., 0., -1_000., 12., 0.],
+        );
+    }
+
+    #[gpui::test]
+    fn reversing_at_a_scroll_edge_does_not_replay_clamped_distance(cx: &mut TestAppContext) {
+        assert_wheel_batch(cx, &[-1_000., 12., 0.]);
+        assert_wheel_batch(cx, &[1_000., -12., 0.]);
+    }
+
+    #[gpui::test]
+    fn scroll_events_preserve_input_packets_and_consumed_movement(cx: &mut TestAppContext) {
+        let state = ListState::new(30, crate::ListAlignment::Top, px(10.)).measure_all();
+        state.scroll_to(ListOffset {
+            item_ix: 5,
+            offset_in_item: px(0.),
+        });
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let observed = events.clone();
+        state.set_scroll_handler(move |event, _, _| {
+            observed
+                .borrow_mut()
+                .push((event.input.clone(), event.scroll_delta));
+        });
+        let window = cx.open_window(size(px(100.), px(100.)), |_, _| WheelList(state.clone()));
+        let mut cx = crate::VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        // Dispatch one batch before the next frame to exercise the production
+        // listener's per-packet advancement from its rendered scroll position.
+        cx.update(|window, cx| {
+            for (delta, phase) in [
+                (-48., gpui::TouchPhase::Started),
+                (12., gpui::TouchPhase::Moved),
+                (0., gpui::TouchPhase::Ended),
+            ] {
+                window.dispatch_event(
+                    gpui::PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position: point(px(20.), px(20.)),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
+                        touch_phase: phase,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            }
+        });
+        let events = events.borrow();
+        assert_eq!(events.len(), 3);
+        for ((event, applied), (requested, consumed, phase)) in events.iter().zip([
+            (-48., 48., gpui::TouchPhase::Started),
+            (12., -12., gpui::TouchPhase::Moved),
+            (0., 0., gpui::TouchPhase::Ended),
+        ]) {
+            assert_eq!(event.delta.pixel_delta(px(20.)).y, px(requested));
+            assert_eq!(*applied, px(consumed));
+            assert_eq!(event.touch_phase, phase);
+        }
+    }
 
     #[gpui::test]
     fn test_autoscroll_above_item_top_renders_items_above(cx: &mut TestAppContext) {
