@@ -53,11 +53,8 @@ fn db_with_bundled_fonts() -> Database {
 
 #[test]
 fn text_with_split_glyph_clusters_in_mixed_fonts_does_not_panic() {
-    let mut db = Database::new();
-    db.load_font_data(IBM_PLEX_REGULAR.to_vec());
-    db.load_font_data(LILEX_REGULAR.to_vec());
     let options = usvg::Options {
-        fontdb: std::sync::Arc::new(db),
+        fontdb: Arc::new(db_with_bundled_fonts()),
         ..Default::default()
     };
 
@@ -225,19 +222,15 @@ fn explicit_font_assets_are_isolated_and_change_text_geometry() -> Result<()> {
         &lilex.parse_svg(source)?,
         SvgSize::Size(Size::new(DevicePixels(160), DevicePixels(40))),
     )?;
-    assert!(
-        plex.as_bytes(0)
-            .unwrap()
-            .chunks_exact(4)
-            .any(|pixel| pixel[3] != 0)
-    );
-    assert!(
-        lilex
-            .as_bytes(0)
-            .unwrap()
-            .chunks_exact(4)
-            .any(|pixel| pixel[3] != 0)
-    );
+    for image in [&plex, &lilex] {
+        assert!(
+            image
+                .as_bytes(0)
+                .unwrap()
+                .chunks_exact(4)
+                .any(|pixel| pixel[3] != 0)
+        );
+    }
     assert_ne!(plex.as_bytes(0), lilex.as_bytes(0));
     Ok(())
 }
