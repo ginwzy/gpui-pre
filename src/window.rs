@@ -41,7 +41,7 @@ use gpui_util::post_inc;
 use gpui_util::{ResultExt, measure};
 use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 use refineable::Refineable;
 use scheduler::Instant;
@@ -487,7 +487,50 @@ impl ArenaClearNeeded {
     }
 }
 
-pub(crate) type FocusMap = RwLock<SlotMap<FocusId, FocusRef>>;
+/// The slots of live focus handles, and the handles whose last reference went
+/// away since the app last freed them.
+#[derive(Default)]
+pub(crate) struct FocusMap {
+    handles: RwLock<SlotMap<FocusId, FocusRef>>,
+    /// A released handle never comes back (`FocusHandle::for_id` does not
+    /// revive a zero count), so freeing these slots frees every dead one.
+    released: Mutex<Vec<FocusId>>,
+    /// Slots that `free_released` has examined.
+    #[cfg(test)]
+    examined: AtomicUsize,
+}
+
+impl FocusMap {
+    pub(crate) fn read(&self) -> RwLockReadGuard<'_, SlotMap<FocusId, FocusRef>> {
+        self.handles.read()
+    }
+
+    pub(crate) fn write(&self) -> RwLockWriteGuard<'_, SlotMap<FocusId, FocusRef>> {
+        self.handles.write()
+    }
+
+    /// Frees the slots of the handles released since the last call and returns
+    /// their IDs. Only those slots are examined, however many handles live.
+    pub(crate) fn free_released(&self) -> Vec<FocusId> {
+        let released = mem::take(&mut *self.released.lock());
+        if released.is_empty() {
+            return released;
+        }
+        #[cfg(test)]
+        self.examined.fetch_add(released.len(), SeqCst);
+        let mut handles = self.handles.write();
+        for id in &released {
+            debug_assert!(
+                handles
+                    .get(*id)
+                    .is_none_or(|focus| focus.ref_count.load(SeqCst) == 0)
+            );
+            handles.remove(*id);
+        }
+        released
+    }
+}
+
 pub(crate) struct FocusRef {
     pub(crate) ref_count: AtomicUsize,
     pub(crate) tab_index: isize,
@@ -653,12 +696,17 @@ impl Eq for FocusHandle {}
 
 impl Drop for FocusHandle {
     fn drop(&mut self) {
-        self.handles
+        let last = self
+            .handles
             .read()
             .get(self.id)
             .unwrap()
             .ref_count
-            .fetch_sub(1, SeqCst);
+            .fetch_sub(1, SeqCst)
+            == 1;
+        if last {
+            self.handles.released.lock().push(self.id);
+        }
     }
 }
 
@@ -7560,8 +7608,11 @@ mod tests {
         cell::{Cell, RefCell},
         path::PathBuf,
         rc::Rc,
+        sync::{Arc, atomic::Ordering::SeqCst},
         time::Duration,
     };
+
+    use super::FocusMap;
 
     use crate::{
         AnyWindowHandle, AppContext as _, Bounds, Context, DispatchPhase, DragMoveEvent, Empty,
@@ -8491,6 +8542,71 @@ mod tests {
             })
             .unwrap();
         assert_eq!(b_focus_count.get(), 1);
+    }
+
+    /// A handle is released when its last reference goes, never while a clone
+    /// lives, and cannot be revived. Freeing the released handles examines only
+    /// their slots, however many others are alive, so an effect flush can free
+    /// them before every effect without rescanning the map.
+    #[test]
+    fn freeing_released_focus_handles_examines_only_their_slots() {
+        let map = Arc::new(FocusMap::default());
+        let live: Vec<_> = (0..1000).map(|_| FocusHandle::new(&map)).collect();
+        assert!(map.free_released().is_empty());
+        assert_eq!(map.examined.load(SeqCst), 0);
+
+        let kept = FocusHandle::new(&map);
+        let clone = kept.clone();
+        let weak = kept.downgrade();
+        let dropped = FocusHandle::new(&map);
+        let dropped_id = dropped.id;
+        drop(kept);
+        drop(dropped);
+        assert_eq!(map.free_released(), [dropped_id]);
+        assert_eq!(map.examined.load(SeqCst), 1);
+        assert_eq!(map.read().len(), 1001);
+        assert!(weak.upgrade().is_some());
+
+        drop(clone);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(map.free_released(), [weak.id]);
+        drop(live);
+        assert_eq!(map.free_released().len(), 1000);
+        assert_eq!(map.examined.load(SeqCst), 1002);
+        assert!(map.read().is_empty());
+    }
+
+    /// The flush after the focused handle is dropped blurs its window and frees
+    /// its slot; a handle that is still held stays focusable.
+    #[gpui::test]
+    fn dropping_the_focused_handle_blurs_its_window(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let (focused, other) = window
+            .update(cx, |_, window, cx| {
+                let focused = cx.focus_handle();
+                window.focus(&focused, cx);
+                (focused, cx.focus_handle())
+            })
+            .unwrap();
+        let slots = |cx: &mut TestAppContext| cx.update(|cx| cx.focus_handles.read().len());
+        let before = slots(cx);
+        window
+            .update(cx, |_, window, _| assert!(focused.is_focused(window)))
+            .unwrap();
+
+        drop(focused);
+        cx.update(|_| {});
+        window
+            .update(cx, |_, window, _| assert_eq!(window.focus, None))
+            .unwrap();
+        assert_eq!(slots(cx), before - 1);
+
+        window
+            .update(cx, |_, window, cx| {
+                window.focus(&other, cx);
+                assert!(other.is_focused(window));
+            })
+            .unwrap();
     }
 
     #[gpui::test]

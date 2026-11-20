@@ -8,7 +8,7 @@ use std::{
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     rc::{Rc, Weak},
-    sync::{Arc, atomic::Ordering::SeqCst},
+    sync::Arc,
     time::Duration,
 };
 
@@ -16,7 +16,6 @@ use anyhow::{Context as _, Result, anyhow};
 use derive_more::{Deref, DerefMut};
 use futures::{Future, FutureExt, channel::oneshot, future::LocalBoxFuture};
 use itertools::Itertools;
-use parking_lot::RwLock;
 use slotmap::SlotMap;
 
 pub use async_context::*;
@@ -776,7 +775,7 @@ pub struct App {
     // We need to ensure the leak detector drops last, after all tasks, callbacks and things have been dropped.
     // Otherwise it may report false positives.
     #[cfg(any(test, feature = "leak-detection"))]
-    _ref_counts: Arc<RwLock<EntityRefCounts>>,
+    _ref_counts: Arc<parking_lot::RwLock<EntityRefCounts>>,
 }
 
 impl App {
@@ -830,7 +829,7 @@ impl App {
                 windows: SlotMap::with_key(),
                 window_update_stack: Vec::new(),
                 window_handles: FxHashMap::default(),
-                focus_handles: Arc::new(RwLock::new(SlotMap::with_key())),
+                focus_handles: Arc::new(FocusMap::default()),
                 keymap: Rc::new(RefCell::new(Keymap::default())),
                 keyboard_layout,
                 keyboard_mapper,
@@ -1813,26 +1812,22 @@ impl App {
     }
 
     /// Repeatedly called during `flush_effects` to handle a focused handle being dropped.
+    /// It runs before every effect, so it visits only the handles released since
+    /// the last call, never every live one.
     fn release_dropped_focus_handles(&mut self) {
-        self.focus_handles
-            .clone()
-            .write()
-            .retain(|handle_id, focus| {
-                if focus.ref_count.load(SeqCst) == 0 {
-                    for window_handle in self.windows() {
-                        window_handle
-                            .update(self, |_, window, cx| {
-                                if window.focus == Some(handle_id) {
-                                    window.blur(cx);
-                                }
-                            })
-                            .unwrap();
+        let released = self.focus_handles.free_released();
+        if released.is_empty() {
+            return;
+        }
+        for window_handle in self.windows() {
+            window_handle
+                .update(self, |_, window, cx| {
+                    if window.focus.is_some_and(|focus| released.contains(&focus)) {
+                        window.blur(cx);
                     }
-                    false
-                } else {
-                    true
-                }
-            });
+                })
+                .unwrap();
+        }
     }
 
     fn apply_notify_effect(&mut self, emitter: EntityId) {
