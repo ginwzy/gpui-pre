@@ -1092,6 +1092,13 @@ impl App {
         self.pending_effects.push_back(Effect::RefreshWindows);
     }
 
+    /// Bytes reserved by the element arena. Its chunks are kept for reuse, so
+    /// this is the most any frame has needed so far.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn element_arena_capacity(&self) -> usize {
+        self.element_arena.borrow().capacity()
+    }
+
     pub(crate) fn update<R>(&mut self, update: impl FnOnce(&mut Self) -> R) -> R {
         self.start_update();
         let result = update(self);

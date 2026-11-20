@@ -35,6 +35,9 @@ pub struct TaffyLayoutEngine {
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
+    /// Nodes in the tree when it was last cleared: the last frame's.
+    #[cfg(any(test, feature = "test-support"))]
+    last_frame_nodes: usize,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
@@ -49,14 +52,25 @@ impl TaffyLayoutEngine {
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            last_frame_nodes: 0,
         }
     }
 
     pub fn clear(&mut self) {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.last_frame_nodes = self.taffy.total_node_count();
+        }
         self.taffy.clear();
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn last_frame_nodes(&self) -> usize {
+        self.last_frame_nodes
     }
 
     pub fn request_layout(

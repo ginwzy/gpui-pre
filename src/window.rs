@@ -2650,6 +2650,15 @@ impl Window {
         count
     }
 
+    /// The layout nodes the last drawn frame created, offscreen measurement
+    /// included.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn last_frame_layout_nodes(&self) -> usize {
+        self.layout_engine
+            .as_ref()
+            .map_or(0, |engine| engine.last_frame_nodes())
+    }
+
     /// Spawn the future returned by the given closure on the application thread pool.
     /// The closure is provided a handle to the current window and an `AsyncWindowContext` for
     /// use within your future.

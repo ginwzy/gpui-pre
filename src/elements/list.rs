@@ -15,7 +15,8 @@ use crate::{
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
-use std::{cell::RefCell, ops::Range, rc::Rc};
+use scheduler::Instant;
+use std::{cell::RefCell, ops::Range, rc::Rc, time::Duration};
 use sum_tree::{Bias, Dimensions, SumTree};
 
 type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
@@ -74,6 +75,26 @@ struct StateInner {
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
     scroll_resolver: Option<ListScrollResolver>,
+    /// Whether a measure-all pass of this list has outlasted a frame.
+    reported_slow_measurement: bool,
+    #[cfg(any(test, feature = "test-support"))]
+    measurement: ListMeasurement,
+}
+
+/// A measure-all pass longer than one 60 Hz frame drops a frame.
+const SLOW_MEASUREMENT: Duration = Duration::from_millis(16);
+
+/// What a list's measure-all passes have measured: the items that had neither
+/// a measured nor a declared height, and the time spent laying them out.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListMeasurement {
+    /// Passes that measured at least one item.
+    pub passes: usize,
+    /// Items measured, over all passes.
+    pub items: usize,
+    /// Time the passes spent, wall clock.
+    pub elapsed: Duration,
 }
 
 /// Decides the scroll top of each layout once every item is measured, before
@@ -545,6 +566,9 @@ impl ListState {
             pending_scroll: None,
             follow_state: FollowState::default(),
             scroll_resolver: None,
+            reported_slow_measurement: false,
+            #[cfg(any(test, feature = "test-support"))]
+            measurement: ListMeasurement::default(),
         })));
         this.splice(0..0, item_count);
         this
@@ -762,6 +786,12 @@ impl ListState {
     /// The number of items in this list.
     pub fn item_count(&self) -> usize {
         self.0.borrow().items.summary().count
+    }
+
+    /// What this list's measure-all passes have measured so far.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn measurement(&self) -> ListMeasurement {
+        self.0.borrow().measurement
     }
 
     /// Whether the list is scrolled to the end, or `None` if the list is
@@ -1360,11 +1390,14 @@ impl StateInner {
         );
 
         let mut measured_items = Vec::default();
+        let started = Instant::now();
+        let mut measured = 0;
 
         for (ix, item) in cursor.enumerate() {
             measured_items.push(if item.size().is_some() {
                 item.clone()
             } else {
+                measured += 1;
                 let mut element = render_item(ix, window, cx);
                 ListItem::Measured {
                     size: element.layout_as_root(available_item_space, window, cx),
@@ -1374,6 +1407,28 @@ impl StateInner {
         }
 
         self.items = SumTree::from_iter(measured_items, ());
+        self.record_measurement(measured, started.elapsed());
+    }
+
+    /// Reports a measure-all pass. Each measured item builds and lays out its
+    /// whole element tree within the frame, so only the first pass of a list
+    /// that outlasts a frame warns; later ones log at debug level.
+    fn record_measurement(&mut self, items: usize, elapsed: Duration) {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.measurement.passes += 1;
+            self.measurement.items += items;
+            self.measurement.elapsed += elapsed;
+        }
+        let milliseconds = elapsed.as_secs_f64() * 1000.;
+        if elapsed >= SLOW_MEASUREMENT && !self.reported_slow_measurement {
+            self.reported_slow_measurement = true;
+            log::warn!(
+                "list measured {items} items in one frame ({milliseconds:.1} ms); items with declared heights are not measured"
+            );
+        } else {
+            log::debug!("list measured {items} items in {milliseconds:.1} ms");
+        }
     }
 
     fn layout_items(
@@ -2708,6 +2763,57 @@ mod test {
         assert_eq!(state.max_offset_for_scrollbar().y, px(10_180. - 50.));
         let top = state.logical_scroll_top();
         assert_eq!((top.item_ix, top.offset_in_item), (900, px(5.)));
+    }
+
+    #[gpui::test]
+    fn measurement_counts_only_items_without_a_height(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        // Items 3 and 700 are measured; every other item declares 10px.
+        let state = ListState::new(0, crate::ListAlignment::Top, px(0.)).measure_all();
+        state.splice_with_heights(
+            0..0,
+            (0..1000).map(|ix| (ix != 3 && ix != 700).then_some(px(10.))),
+        );
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(30.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
+        let draw = |width: f32, cx: &mut crate::VisualTestContext| {
+            cx.draw(point(px(0.), px(0.)), size(px(width), px(50.)), |_, _| {
+                view.clone().into_any_element()
+            });
+        };
+        let counted = |state: &ListState| {
+            let measurement = state.measurement();
+            (measurement.passes, measurement.items)
+        };
+
+        // Off screen or not, only the items without a height are measured;
+        // visible declared items are laid out without being counted.
+        draw(100., cx);
+        assert_eq!(counted(&state), (1, 2));
+        draw(100., cx);
+        assert_eq!(counted(&state), (1, 2));
+        // A new width measures them again, and only them.
+        draw(140., cx);
+        assert_eq!(counted(&state), (2, 4));
+        // Inserted items wait until measuring is armed again.
+        state.splice(10..10, 3);
+        draw(140., cx);
+        assert_eq!(counted(&state), (2, 4));
+        state.clone().measure_all();
+        draw(140., cx);
+        assert_eq!(counted(&state), (3, 7));
     }
 
     #[test]
