@@ -107,9 +107,46 @@ pub type ListScrollResolver =
 pub struct ListGeometry<'a> {
     state: &'a mut StateInner,
     viewport_height: Pixels,
+    presentation: ItemPresentation,
+}
+
+/// Wheel packets for a resolver whose initial content position is not ready.
+/// Dropping the request instead of releasing it discards its input.
+#[derive(Clone, Default)]
+pub struct PendingListWheel(Rc<RefCell<VecDeque<ScrollWheelEvent>>>);
+
+impl PendingListWheel {
+    fn push(&self, event: &ScrollWheelEvent) {
+        // A stalled opening must not collect an unlimited input backlog or
+        // replay one on the UI thread. Prefer the latest gesture on overflow.
+        const MAX_PACKETS: usize = 64;
+        let mut packets = self.0.borrow_mut();
+        if packets.len() == MAX_PACKETS {
+            packets.pop_front();
+        }
+        packets.push_back(event.clone());
+    }
+}
+
+#[derive(Default)]
+enum ItemPresentation {
+    #[default]
+    Ready,
+    Waiting(PendingListWheel),
+    Release(PendingListWheel),
 }
 
 impl ListGeometry<'_> {
+    /// Measure normally, but do not lay out visible items at a fallback offset.
+    pub fn wait_for_position(&mut self, wheel: &PendingListWheel) {
+        self.presentation = ItemPresentation::Waiting(wheel.clone());
+    }
+
+    /// Consume packets received while waiting, from this layout's resolved top.
+    pub fn position_ready(&mut self, wheel: PendingListWheel) {
+        self.presentation = ItemPresentation::Release(wheel);
+    }
+
     /// The number of items.
     pub fn item_count(&self) -> usize {
         self.state.items.summary().count
@@ -328,6 +365,7 @@ pub enum ListHorizontalSizingBehavior {
 }
 
 struct LayoutItemsResponse {
+    presentation: ItemPresentation,
     max_item_width: Pixels,
     scroll_top: ListOffset,
     item_layouts: VecDeque<ItemLayout>,
@@ -1644,6 +1682,7 @@ impl StateInner {
         }
 
         LayoutItemsResponse {
+            presentation: ItemPresentation::Ready,
             max_item_width,
             scroll_top,
             item_layouts,
@@ -1667,13 +1706,25 @@ impl StateInner {
                 _ => {}
             }
 
+            let mut presentation = ItemPresentation::Ready;
             if let Some(resolver) = self.scroll_resolver.clone() {
                 let viewport_height = bounds.size.height - padding.top - padding.bottom;
                 let mut geometry = ListGeometry {
                     state: self,
                     viewport_height,
+                    presentation: ItemPresentation::Ready,
                 };
-                if let Some(scroll_top) = resolver(&mut geometry, window, cx) {
+                let top = resolver(&mut geometry, window, cx);
+                presentation = geometry.presentation;
+                if matches!(presentation, ItemPresentation::Waiting(_)) {
+                    return Ok(LayoutItemsResponse {
+                        presentation,
+                        scroll_top: self.logical_scroll_top(),
+                        max_item_width: px(0.),
+                        item_layouts: VecDeque::new(),
+                    });
+                }
+                if let Some(scroll_top) = top {
                     self.pending_scroll = None;
                     self.logical_scroll_top = Some(scroll_top);
                 }
@@ -1687,6 +1738,11 @@ impl StateInner {
                 window,
                 cx,
             );
+            // The first published position wins over child autoscroll, just
+            // as it does over the list's initial offset. A retry would drop
+            // this layout's pending input before it reached paint.
+            let autoscroll = autoscroll && !matches!(presentation, ItemPresentation::Release(_));
+            layout_response.presentation = presentation;
 
             // Avoid honoring autoscroll requests from elements other than our children.
             window.take_autoscroll();
@@ -2011,8 +2067,23 @@ impl Element for List {
         let height = bounds.size.height;
         let mut scroll_top = prepaint.layout.scroll_top;
         let hitbox_id = prepaint.hitbox.id;
+        let waiting = match std::mem::take(&mut prepaint.layout.presentation) {
+            ItemPresentation::Waiting(wheel) => Some(wheel),
+            ItemPresentation::Release(wheel) => {
+                for event in wheel.0.take() {
+                    list_state.0.borrow_mut().scroll(&mut scroll_top, height,
+                        event.delta.pixel_delta(px(20.)), &event, current_view, window, cx);
+                }
+                None
+            }
+            ItemPresentation::Ready => None,
+        };
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
+                if let Some(wheel) = &waiting {
+                    wheel.push(event);
+                    return;
+                }
                 // Apply each original packet from the preceding resolved position.
                 // Reversals and gesture ends cannot replay consumed motion, and
                 // distance clipped at an edge cannot delay the next reverse input.
