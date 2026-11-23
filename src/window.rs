@@ -1244,8 +1244,6 @@ pub struct Window {
     /// input session can restart the IME connection).
     last_text_input_configuration: Option<TextInputConfiguration>,
     focused_text_input_active: bool,
-    // Delivery state only: geometry remains owned by the current input handler.
-    last_ime_position: Option<(Option<FocusId>, Bounds<Pixels>, f32)>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
@@ -2110,7 +2108,6 @@ impl Window {
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input_active: false,
-            last_ime_position: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
@@ -3307,11 +3304,6 @@ impl Window {
                     TextInputStateChange::FocusLost
                 });
         }
-
-        // All input elements have finished painting their current geometry and
-        // the winning handler is installed. Synchronize here, including reused
-        // paint ranges, rather than asking each component to schedule a frame.
-        self.sync_ime_position(cx, false);
 
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
@@ -6438,30 +6430,16 @@ impl Window {
         self.platform_window.toggle_simple_fullscreen();
     }
 
-    /// Forces the IME candidate position to be resent on the next frame.
-    /// Normal focus and geometry changes are synchronized automatically after paint.
+    /// Updates the IME panel position suggestions for languages like japanese, chinese.
     pub fn invalidate_character_coordinates(&self) {
-        self.on_next_frame(|window, cx| window.sync_ime_position(cx, true));
-    }
-
-    fn sync_ime_position(&mut self, cx: &mut App, force: bool) {
-        if !self.is_window_active() || !self.focused_text_input_active {
-            self.last_ime_position = None;
-            return;
-        }
-        let Some(mut input_handler) = self.platform_window.take_input_handler() else {
-            self.last_ime_position = None;
-            return;
-        };
-        let bounds = input_handler.selected_bounds(self, cx);
-        self.platform_window.set_input_handler(input_handler);
-        let position = bounds.map(|bounds| (self.focus, bounds, self.scale_factor()));
-        if let Some((_, bounds, _)) = position
-            && (force || self.last_ime_position != position)
-        {
-            self.platform_window.update_ime_position(bounds);
-        }
-        self.last_ime_position = position;
+        self.on_next_frame(|window, cx| {
+            if let Some(mut input_handler) = window.platform_window.take_input_handler() {
+                if let Some(bounds) = input_handler.selected_bounds(window, cx) {
+                    window.platform_window.update_ime_position(bounds);
+                }
+                window.platform_window.set_input_handler(input_handler);
+            }
+        });
     }
 
     /// Present a platform dialog.

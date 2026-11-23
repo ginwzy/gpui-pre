@@ -2,7 +2,7 @@
 
 This repository starts from the published `gpui-pre` 0.3.5 snapshot of
 Zed `d89e9c2124b2786a390c7a451c7488601b4da2e1`. It keeps the snapshot's crate
-versions and adds window-owned IME candidate position synchronization.
+versions.
 Run its unit tests with `cargo test --lib --features test-support`.
 
 GPUI is a hybrid immediate and retained mode, GPU accelerated, UI framework
